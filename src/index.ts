@@ -55,6 +55,7 @@ interface TelegramUpdate {
     from?: TgUser;
     text?: string;
     photo?: Array<{ file_id: string; file_size?: number }>;
+    media_group_id?: string;
   };
   callback_query?: {
     id: string;
@@ -228,6 +229,24 @@ async function putSession(env: Env, chatId: number, session: Session) {
   await env.SESSIONS.put(sessionKey(chatId), JSON.stringify(session), { expirationTtl: 3600 });
 }
 async function removeImages(env: Env, keys: string[]) { if (keys.length) await env.MEDIA.delete(keys); }
+async function listAllUploadKeys(env: Env, chatId: number) {
+  const objects: R2Object[] = [];
+  let cursor: string | undefined;
+  do {
+    const listed = await env.MEDIA.list({ prefix: `uploads/${chatId}/`, limit: 1000, cursor });
+    objects.push(...listed.objects);
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+  return objects
+    .sort((a, b) => a.uploaded.getTime() - b.uploaded.getTime() || a.key.localeCompare(b.key))
+    .map((object) => object.key);
+}
+async function listUploadKeys(env: Env, chatId: number) {
+  return (await listAllUploadKeys(env, chatId)).slice(0, 10);
+}
+async function removeAllUploadImages(env: Env, chatId: number) {
+  await removeImages(env, await listAllUploadKeys(env, chatId));
+}
 async function dailyUsed(env: Env, userId: number) { return Number((await env.SESSIONS.get(dailyKey(userId))) || 0); }
 async function checkDailyLimit(env: Env, userId: number) {
   if (isAdmin(env, userId)) return { allowed: true, used: 0, left: DAILY_LIMIT };
@@ -249,8 +268,7 @@ async function consumeDailyLimit(env: Env, userId: number) {
 async function resetSession(env: Env, chatId: number) {
   const limit = await checkDailyLimit(env, chatId);
   if (!limit.allowed) return sendMessage(env, chatId, "⛔ Денний ліміт вичерпано. Доступно <b>5 відео на день</b>. Ліміт оновиться опівночі за Києвом.");
-  const old = await getSession(env, chatId);
-  if (old) await removeImages(env, old.imageKeys);
+  await removeAllUploadImages(env, chatId);
   await putSession(env, chatId, { step: "photos", imageKeys: [] });
   await sendMessage(env, chatId, `Надішли <b>4–10 фото</b>. Коли завершиш — натисни «Далі».
 Сьогодні залишилося відео: <b>${limit.left}</b>`, photosKeyboard);
@@ -265,19 +283,23 @@ async function downloadTelegramPhoto(env: Env, fileId: string) {
 async function acceptPhoto(env: Env, chatId: number, photos: Array<{ file_id: string }>) {
   const session = await getSession(env, chatId);
   if (!session || session.step !== "photos") return sendMessage(env, chatId, "Спочатку натисни «Створити слайд-шоу».", createKeyboard);
-  if (session.imageKeys.length >= 10) return sendMessage(env, chatId, "Уже є максимум 10 фото. Натисни «Далі».", photosKeyboard);
+  const existingKeys = await listUploadKeys(env, chatId);
+  if (existingKeys.length >= 10) return sendMessage(env, chatId, "Уже є максимум 10 фото. Натисни «Далі».", photosKeyboard);
   const { data, ext } = await downloadTelegramPhoto(env, photos[photos.length - 1].file_id);
   if (data.byteLength > 15 * 1024 * 1024) return sendMessage(env, chatId, "Це фото завелике. Максимум — 15 МБ.");
   const key = `uploads/${chatId}/${crypto.randomUUID()}.${ext}`;
   await env.MEDIA.put(key, data, { httpMetadata: { contentType: `image/${ext === "jpg" ? "jpeg" : ext}` } });
-  session.imageKeys.push(key);
+  const keys = await listUploadKeys(env, chatId);
+  session.imageKeys = keys;
   await putSession(env, chatId, session);
-  const count = session.imageKeys.length;
+  const count = keys.length;
   await sendMessage(env, chatId, `Фото додано: <b>${count}/10</b>${count < 4 ? `\nПотрібно ще мінімум ${4 - count}.` : "\nМожна переходити далі."}`, photosKeyboard);
 }
 async function chooseCreationMode(env: Env, chatId: number) {
   const session = await getSession(env, chatId);
-  if (!session || session.imageKeys.length < 4) return sendMessage(env, chatId, "Потрібно завантажити щонайменше 4 фото.", photosKeyboard);
+  if (!session) return sendMessage(env, chatId, "Спочатку натисни «Створити слайд-шоу».", createKeyboard);
+  session.imageKeys = await listUploadKeys(env, chatId);
+  if (session.imageKeys.length < 4) return sendMessage(env, chatId, `Знайдено <b>${session.imageKeys.length}</b> фото. Потрібно завантажити щонайменше 4.`, photosKeyboard);
   if (session.templatePreset && session.duration && session.interval && session.darkness && session.vignette && session.orderMode && session.format && session.effect && session.templateName) {
     session.step = "confirm"; await putSession(env, chatId, session); return showConfirmation(env, chatId, session);
   }
@@ -346,6 +368,8 @@ async function showConfirmation(env: Env, chatId: number, session: Session) {
 async function startRender(env: Env, chatId: number) {
   const session = await getSession(env, chatId);
   if (!session || session.step !== "confirm" || !session.duration || !session.interval || !session.darkness || !session.vignette || !session.orderMode || !session.format || !session.effect || !session.templateName) return;
+  session.imageKeys = await listUploadKeys(env, chatId);
+  if (session.imageKeys.length < 4) return sendMessage(env, chatId, "Фото не знайдено. Почни створення заново й надішли 4–10 фото.", createKeyboard);
   const limit = await checkDailyLimit(env, chatId);
   if (!limit.allowed) return sendMessage(env, chatId, "⛔ Денний ліміт у 5 відео вичерпано. Спробуй після опівночі за Києвом.");
   if (await env.SESSIONS.get(`active-job:${chatId}`)) return sendMessage(env, chatId, "У тебе вже є активна генерація.");
@@ -460,6 +484,7 @@ async function startWithTemplate(env: Env, chatId: number, id: string) {
   const t = await env.SESSIONS.get<UserTemplate>(`user-template:${chatId}:${id}`, "json");
   if (!t) return listUserTemplates(env, chatId);
   const limit = await checkDailyLimit(env, chatId); if (!limit.allowed) return sendMessage(env, chatId, "Денний ліміт вичерпано.");
+  await removeAllUploadImages(env, chatId);
   await putSession(env, chatId, { step: "photos", imageKeys: [], ...t.settings, templatePreset: true });
   await sendMessage(env, chatId, `Шаблон <b>${escapeHtml(t.name)}</b> вибрано. Надішли 4–10 фото.`, photosKeyboard);
 }

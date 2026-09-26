@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, rm, link, copyFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -38,14 +38,18 @@ try {
     if (!response.ok) throw new Error(`Image ${i}: HTTP ${response.status}`);
     const path = join(dir, `image-${i}.jpg`); await writeFile(path, Buffer.from(await response.arrayBuffer())); paths.push(path);
   }
-  const seq = sequence(paths.length, Math.ceil(job.duration / job.interval) + 1, job.orderMode); const concat = [];
-  for (const index of seq) { concat.push(`file '${paths[index]}'`); concat.push(`duration ${job.interval}`); }
-  concat.push(`file '${paths[seq.at(-1)]}'`);
-  const listPath = join(dir, "frames.ffconcat"); await writeFile(listPath, `ffconcat version 1.0\n${concat.join("\n")}\n`);
+  const framesNeeded = Math.max(1, Math.ceil(job.duration / job.interval));
+  const seq = sequence(paths.length, framesNeeded, job.orderMode);
+  for (let i = 0; i < seq.length; i++) {
+    const framePath = join(dir, `frame-${String(i).padStart(6, "0")}.jpg`);
+    try { await link(paths[seq[i]], framePath); } catch { await copyFile(paths[seq[i]], framePath); }
+  }
   const [width, height] = formats[job.format];
   const effect = job.effect === "zoom" ? `scale=w='trunc(iw*(1+0.06*mod(t\\,1))/2)*2':h='trunc(ih*(1+0.06*mod(t\\,1))/2)*2':eval=frame,crop=${width}:${height}`
     : job.effect === "flash" ? `drawbox=x=0:y=0:w=iw:h=ih:color=white@0.55:t=fill:enable='lt(mod(t\\,${job.interval})\\,0.04)'`
     : job.effect === "glitch" ? "rgbashift=rh=4:bh=-4,noise=alls=7:allf=t+u" : null;
   const filter = [`scale=${width}:${height}:force_original_aspect_ratio=increase`, `crop=${width}:${height}`, `eq=brightness=${brightness[job.darkness]}:contrast=1.04:saturation=0.95`, vignettes[job.vignette], effect, "fps=30", "format=yuv420p"].filter(Boolean).join(",");
-  await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", listPath, "-t", String(job.duration), "-vf", filter, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-movflags", "+faststart", outputPath]);
+  await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-framerate", (1 / job.interval).toFixed(6), "-start_number", "0", "-i", join(dir, "frame-%06d.jpg"), "-t", String(job.duration), "-vf", filter, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-movflags", "+faststart", outputPath]);
+  const output = await stat(outputPath);
+  if (output.size < 10 * 1024) throw new Error(`Rendered video is unexpectedly small: ${output.size} bytes`);
 } finally { await rm(dir, { recursive: true, force: true }); }

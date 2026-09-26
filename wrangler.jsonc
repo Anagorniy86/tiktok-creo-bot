@@ -1,0 +1,61 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tiktok-creo-bot",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "triggers": {
+    "crons": ["17 * * * *"]
+  },
+  "kv_namespaces": [
+    {
+      "binding": "SESSIONS",
+      "id": "PASTE_KV_NAMESPACE_ID_HERE"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MEDIA",
+      "bucket_name": "tiktok-creo-media"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "RENDER_QUEUE",
+        "queue": "tiktok-creo-render"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "tiktok-creo-render",
+        "max_batch_size": 1,
+        "max_batch_timeout": 2,
+        "max_retries": 2,
+        "dead_letter_queue": "tiktok-creo-render-dlq"
+      }
+    ]
+  },
+  "containers": [
+    {
+      "class_name": "RenderContainer",
+      "image": "./Dockerfile",
+      "max_instances": 3,
+      "instance_type": "basic"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "RENDER_CONTAINER",
+        "class_name": "RenderContainer"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["RenderContainer"]
+    }
+  ]
+}

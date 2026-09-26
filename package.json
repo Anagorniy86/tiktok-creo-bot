@@ -1,0 +1,20 @@
+{
+  "name": "tiktok-creo-telegram-bot",
+  "version": "5.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "renderer:test": "bash scripts/test-renderer.sh"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "0.3.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260925.1",
+    "typescript": "^5.9.2",
+    "wrangler": "^4.37.0"
+  }
+}

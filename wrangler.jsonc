@@ -14,5 +14,9 @@
   ],
   "r2_buckets": [
     { "binding": "MEDIA", "bucket_name": "tiktok-creo-media" }
+  ],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["RenderContainer"] },
+    { "tag": "v2", "deleted_classes": ["RenderContainer"] }
   ]
 }

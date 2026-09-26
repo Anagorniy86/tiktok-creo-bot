@@ -9,7 +9,7 @@ interface Env {
   WORKER_BASE_URL: string;
 }
 
-type Step = "photos" | "template" | "duration" | "speed" | "darkness" | "vignette" | "order" | "effect" | "format" | "confirm" | "template_name" | "template_rename" | "template_copy" | "admin_input" | "rendering";
+type Step = "photos" | "template" | "duration" | "speed" | "darkness" | "vignette" | "order" | "effect" | "format" | "confirm" | "template_name" | "template_rename" | "template_copy" | "promo_input" | "feedback_input" | "admin_input" | "rendering";
 type Darkness = "none" | "light" | "standard" | "strong";
 type Vignette = "none" | "light" | "standard" | "strong";
 type OrderMode = "original" | "shuffle_once" | "random_no_repeat";
@@ -29,8 +29,10 @@ interface Session {
   effect?: Effect;
   templateName?: TemplateName;
   templatePreset?: boolean;
+  batchCount?: number;
   actionTemplateId?: string;
-  adminAction?: "limit" | "reset_limit" | "block" | "unblock" | "broadcast";
+  feedbackJobId?: string;
+  adminAction?: "limit" | "reset_limit" | "block" | "unblock" | "broadcast" | "premium" | "promo";
 }
 interface RenderJob {
   jobId: string;
@@ -56,7 +58,9 @@ interface TelegramUpdate {
     text?: string;
     photo?: Array<{ file_id: string; file_size?: number }>;
     media_group_id?: string;
+    successful_payment?: { invoice_payload: string; currency: string; total_amount: number };
   };
+  pre_checkout_query?: { id: string; from: TgUser; invoice_payload: string; currency: string; total_amount: number };
   callback_query?: {
     id: string;
     from: TgUser;
@@ -64,12 +68,14 @@ interface TelegramUpdate {
     message?: { chat: { id: number } };
   };
 }
-interface StoredUser extends TgUser { lastSeen: string; blocked?: boolean }
+interface StoredUser extends TgUser { lastSeen: string; blocked?: boolean; referrerId?: number; referralQualified?: boolean }
 interface SavedSettings {
   duration: number; interval: number; darkness: Darkness; vignette: Vignette;
   orderMode: OrderMode; format: VideoFormat; effect: Effect; templateName: TemplateName;
 }
 interface UserTemplate { id: string; ownerId: number; name: string; settings: SavedSettings; createdAt: string }
+interface LimitBoost { amount: number; expiresAt: number; source: string }
+interface PromoCode { code: string; type: "videos" | "premium"; value: number; maxUses: number; usedBy: number[] }
 
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), {
   status,
@@ -80,8 +86,11 @@ const userKey = (userId: number) => `user:${userId}`;
 const metricKey = (name: string) => `metric:${name}`;
 const kyivDate = () => new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Kyiv", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
 const dailyKey = (userId: number) => `daily:${userId}:${kyivDate()}`;
-const DAILY_LIMIT = 5;
-const RATE_LIMIT_PER_MINUTE = 30;
+const DAILY_LIMIT = 10;
+const PREMIUM_STARS = 100;
+const PREMIUM_DAYS = 30;
+const BOT_USERNAME = "avto_creo_bot";
+const RATE_LIMIT_PER_MINUTE = 60;
 const OUTPUT_TTL_MS = 72 * 60 * 60 * 1000;
 const UPLOAD_TTL_MS = 6 * 60 * 60 * 1000;
 const QUEUE_ALERT_THRESHOLD = 20;
@@ -147,7 +156,8 @@ async function registerUser(env: Env, user?: TgUser) {
   if (!user) return;
   const key = userKey(user.id);
   const existing = await env.SESSIONS.get<StoredUser>(key, "json");
-  const saved: StoredUser = { ...user, lastSeen: new Date().toISOString(), blocked: existing?.blocked || false };
+  if (existing && Date.now() - new Date(existing.lastSeen).getTime() < 10 * 60 * 1000) return;
+  const saved: StoredUser = { ...existing, ...user, lastSeen: new Date().toISOString(), blocked: existing?.blocked || false };
   await env.SESSIONS.put(key, JSON.stringify(saved));
   if (!existing) await incMetric(env, "total_users");
   const recent = ((await env.SESSIONS.get("admin:recent_users", "json")) as number[] | null) || [];
@@ -159,14 +169,22 @@ async function isBlocked(env: Env, userId: number) {
 }
 
 const createKeyboard = { inline_keyboard: [
-  [{ text: "🎞 Створити слайд-шоу", callback_data: "create" }],
+  [{ text: "🎞 Створити одне відео", callback_data: "create" }],
+  [{ text: "🎬 Створити декілька відео", callback_data: "batch_create" }],
+  [{ text: "⭐ Безліміт — 100 Stars", callback_data: "buy_premium" }],
+  [{ text: "🎁 Реферальна програма", callback_data: "referral" }, { text: "🎟 Промокод", callback_data: "promo" }],
   [{ text: "📁 Мої шаблони", callback_data: "my_templates" }],
   [{ text: "👤 Мій профіль", callback_data: "profile" }, { text: "ℹ️ Допомога", callback_data: "help" }],
   [{ text: "🗑 Видалити мої дані", callback_data: "delete_my_data" }],
 ] };
+const batchCountKeyboard = { inline_keyboard: [
+  [3, 4].map((n) => ({ text: `${n} відео`, callback_data: `batch_count:${n}` })),
+  [5, 6].map((n) => ({ text: `${n} відео`, callback_data: `batch_count:${n}` })),
+  [{ text: "⬅️ Головне меню", callback_data: "main_menu" }],
+] };
 const photosKeyboard = { inline_keyboard: [
   [{ text: "✅ Далі", callback_data: "photos_done" }],
-  [{ text: "🗑 Почати заново", callback_data: "create" }],
+  [{ text: "🗑 Почати заново", callback_data: "photos_restart" }],
 ] };
 const durationKeyboard = { inline_keyboard: [
   [10, 15, 30, 60].map((n) => ({ text: `${n} сек`, callback_data: `duration:${n}` })),
@@ -220,6 +238,7 @@ const adminKeyboard = { inline_keyboard: [
   [{ text: "🔧 Технічні роботи", callback_data: "admin:maintenance" }],
   [{ text: "🎚 Встановити ліміт", callback_data: "admin:limit" }, { text: "♻️ Скинути ліміт", callback_data: "admin:reset_limit" }],
   [{ text: "🚫 Заблокувати", callback_data: "admin:block" }, { text: "✅ Розблокувати", callback_data: "admin:unblock" }],
+  [{ text: "⭐ Видати безліміт", callback_data: "admin:premium" }, { text: "🎟 Створити промокод", callback_data: "admin:promo" }],
   [{ text: "📣 Розсилка", callback_data: "admin:broadcast" }],
   [{ text: "⬅️ Головне меню", callback_data: "main_menu" }],
 ] };
@@ -242,11 +261,11 @@ async function listAllUploadKeys(env: Env, chatId: number) {
     .map((object) => object.key);
 }
 async function listUploadKeys(env: Env, chatId: number) {
-  return (await listAllUploadKeys(env, chatId)).slice(0, 10);
+  return (await listAllUploadKeys(env, chatId)).slice(0, 30);
 }
 async function resolveImageKeys(env: Env, chatId: number, session: Session) {
   const listed = await listUploadKeys(env, chatId);
-  const candidates = [...new Set([...listed, ...session.imageKeys])].slice(0, 10);
+  const candidates = [...new Set([...listed, ...session.imageKeys])].slice(0, 30);
   const existing = await Promise.all(candidates.map(async (key) => await env.MEDIA.head(key) ? key : null));
   return existing.filter((key): key is string => Boolean(key));
 }
@@ -254,30 +273,60 @@ async function removeAllUploadImages(env: Env, chatId: number) {
   await removeImages(env, await listAllUploadKeys(env, chatId));
 }
 async function dailyUsed(env: Env, userId: number) { return Number((await env.SESSIONS.get(dailyKey(userId))) || 0); }
+async function premiumUntil(env: Env, userId: number) { return Number((await env.SESSIONS.get(`premium:${userId}`)) || 0); }
+async function activeBoosts(env: Env, userId: number) {
+  const boosts = ((await env.SESSIONS.get(`limit-boosts:${userId}`, "json")) as LimitBoost[] | null) || [];
+  const active = boosts.filter((boost) => boost.expiresAt > Date.now());
+  if (active.length !== boosts.length) await env.SESSIONS.put(`limit-boosts:${userId}`, JSON.stringify(active));
+  return active;
+}
 async function checkDailyLimit(env: Env, userId: number) {
-  if (isAdmin(env, userId)) return { allowed: true, used: 0, left: DAILY_LIMIT };
   const used = await dailyUsed(env, userId);
+  const premium = await premiumUntil(env, userId);
+  if (premium > Date.now()) return { allowed: true, used, left: Number.MAX_SAFE_INTEGER, limit: Number.MAX_SAFE_INTEGER, premiumUntil: premium };
   const custom = await env.SESSIONS.get(`limit:${userId}`);
-  const limit = custom === null ? DAILY_LIMIT : Number(custom);
-  return { allowed: used < limit, used, left: Math.max(0, limit - used) };
+  const boost = (await activeBoosts(env, userId)).reduce((sum, item) => sum + item.amount, 0);
+  const limit = (custom === null ? DAILY_LIMIT : Number(custom)) + boost;
+  return { allowed: used < limit, used, left: Math.max(0, limit - used), limit, premiumUntil: 0 };
+}
+async function grantPremium(env: Env, userId: number, days = PREMIUM_DAYS) {
+  const current = await premiumUntil(env, userId);
+  const base = Math.max(Date.now(), current);
+  const until = base + days * 86400000;
+  await env.SESSIONS.put(`premium:${userId}`, String(until));
+  return until;
+}
+async function addLimitBoost(env: Env, userId: number, amount: number, days: number, source: string) {
+  const boosts = await activeBoosts(env, userId);
+  boosts.push({ amount, expiresAt: Date.now() + days * 86400000, source });
+  await env.SESSIONS.put(`limit-boosts:${userId}`, JSON.stringify(boosts));
 }
 async function refundDailyLimit(env: Env, key?: string) {
   if (!key) return;
   const used = Number((await env.SESSIONS.get(key)) || 0);
   await env.SESSIONS.put(key, String(Math.max(0, used - 1)), { expirationTtl: 172800 });
 }
-async function consumeDailyLimit(env: Env, userId: number) {
-  if (isAdmin(env, userId)) return;
+async function consumeDailyLimit(env: Env, userId: number, count = 1) {
+  if (await premiumUntil(env, userId) > Date.now()) return;
   const key = dailyKey(userId); const used = await dailyUsed(env, userId);
-  await env.SESSIONS.put(key, String(used + 1), { expirationTtl: 172800 });
+  await env.SESSIONS.put(key, String(used + count), { expirationTtl: 172800 });
 }
+const leftLabel = (limit: Awaited<ReturnType<typeof checkDailyLimit>>) => limit.premiumUntil ? "безліміт" : String(limit.left);
 async function resetSession(env: Env, chatId: number) {
   const limit = await checkDailyLimit(env, chatId);
-  if (!limit.allowed) return sendMessage(env, chatId, "⛔ Денний ліміт вичерпано. Доступно <b>5 відео на день</b>. Ліміт оновиться опівночі за Києвом.");
+  if (!limit.allowed) return sendMessage(env, chatId, "⛔ Денний ліміт вичерпано. Безкоштовно доступно <b>10 відео на день</b>.");
   await removeAllUploadImages(env, chatId);
   await putSession(env, chatId, { step: "photos", imageKeys: [] });
   await sendMessage(env, chatId, `Надішли <b>4–10 фото</b>. Коли завершиш — натисни «Далі».
-Сьогодні залишилося відео: <b>${limit.left}</b>`, photosKeyboard);
+Сьогодні залишилося відео: <b>${leftLabel(limit)}</b>`, photosKeyboard);
+}
+async function resetBatchSession(env: Env, chatId: number, batchCount: number) {
+  if (![3, 4, 5, 6].includes(batchCount)) return;
+  const limit = await checkDailyLimit(env, chatId);
+  if (!limit.premiumUntil && limit.left < batchCount) return sendMessage(env, chatId, `Потрібно щонайменше <b>${batchCount}</b> доступних генерацій. Зараз залишилося: <b>${limit.left}</b>.`);
+  await removeAllUploadImages(env, chatId);
+  await putSession(env, chatId, { step: "photos", imageKeys: [], batchCount });
+  await sendMessage(env, chatId, `Надішли одним або кількома альбомами <b>${batchCount * 4}–${batchCount * 5} фото</b>. З них буде створено <b>${batchCount} різних відео</b> по 4–5 фото.`, photosKeyboard);
 }
 async function downloadTelegramPhoto(env: Env, fileId: string) {
   const result = (await telegram(env, "getFile", { file_id: fileId })) as { file_path: string };
@@ -290,7 +339,9 @@ async function acceptPhoto(env: Env, chatId: number, photos: Array<{ file_id: st
   const session = await getSession(env, chatId);
   if (!session || session.step !== "photos") return sendMessage(env, chatId, "Спочатку натисни «Створити слайд-шоу».", createKeyboard);
   const existingKeys = await listUploadKeys(env, chatId);
-  if (existingKeys.length >= 10) return sendMessage(env, chatId, "Уже є максимум 10 фото. Натисни «Далі».", photosKeyboard);
+  const maxPhotos = session.batchCount ? session.batchCount * 5 : 10;
+  const minPhotos = session.batchCount ? session.batchCount * 4 : 4;
+  if (existingKeys.length >= maxPhotos) return sendMessage(env, chatId, `Уже є максимум ${maxPhotos} фото. Натисни «Далі».`, photosKeyboard);
   const { data, ext } = await downloadTelegramPhoto(env, photos[photos.length - 1].file_id);
   if (data.byteLength > 15 * 1024 * 1024) return sendMessage(env, chatId, "Це фото завелике. Максимум — 15 МБ.");
   const key = `uploads/${chatId}/${crypto.randomUUID()}.${ext}`;
@@ -304,17 +355,18 @@ async function acceptPhoto(env: Env, chatId: number, photos: Array<{ file_id: st
     if (!currentMarker || await currentMarker.text() !== marker) return;
     await env.MEDIA.delete(markerKey);
   }
-  const keys = await resolveImageKeys(env, chatId, session);
+  const keys = (await resolveImageKeys(env, chatId, session)).slice(0, maxPhotos);
   session.imageKeys = keys;
   await putSession(env, chatId, session);
   const count = keys.length;
-  await sendMessage(env, chatId, `✅ Фото прийнято: <b>${count}/10</b>${count < 4 ? `\nПотрібно ще мінімум ${4 - count}.` : "\nМожна переходити далі."}`, photosKeyboard);
+  await sendMessage(env, chatId, `✅ Фото прийнято: <b>${count}/${maxPhotos}</b>${count < minPhotos ? `\nПотрібно ще мінімум ${minPhotos - count}.` : "\nМожна переходити далі."}`, photosKeyboard);
 }
 async function chooseCreationMode(env: Env, chatId: number) {
   const session = await getSession(env, chatId);
   if (!session) return sendMessage(env, chatId, "Спочатку натисни «Створити слайд-шоу».", createKeyboard);
   session.imageKeys = await resolveImageKeys(env, chatId, session);
-  if (session.imageKeys.length < 4) return sendMessage(env, chatId, `Знайдено <b>${session.imageKeys.length}</b> фото. Потрібно завантажити щонайменше 4.`, photosKeyboard);
+  const minPhotos = session.batchCount ? session.batchCount * 4 : 4;
+  if (session.imageKeys.length < minPhotos) return sendMessage(env, chatId, `Знайдено <b>${session.imageKeys.length}</b> фото. Потрібно щонайменше <b>${minPhotos}</b>.`, photosKeyboard);
   if (session.templatePreset && session.duration && session.interval && session.darkness && session.vignette && session.orderMode && session.format && session.effect && session.templateName) {
     session.step = "confirm"; await putSession(env, chatId, session); return showConfirmation(env, chatId, session);
   }
@@ -378,36 +430,51 @@ async function setFormat(env: Env, chatId: number, format: VideoFormat) {
 }
 async function showConfirmation(env: Env, chatId: number, session: Session) {
   if (!session.duration || !session.interval || !session.darkness || !session.vignette || !session.orderMode || !session.format || !session.templateName) return;
-  await sendMessage(env, chatId, `<b>Перевір налаштування</b>\n\nШаблон: ${escapeHtml(session.templateName)}\nТривалість: ${session.duration} сек\nШвидкість: ${session.interval} сек\nЗатемнення: ${labels.darkness[session.darkness]}\nВіньєтка: ${labels.vignette[session.vignette]}\nПорядок: ${labels.order[session.orderMode]}\nФормат: ${labels.format[session.format]}\nWatermark: немає`, confirmKeyboard);
+  await sendMessage(env, chatId, `<b>Перевір налаштування</b>\n\n${session.batchCount ? `Кількість відео: ${session.batchCount}\n` : ""}Шаблон: ${escapeHtml(session.templateName)}\nТривалість: ${session.duration} сек\nШвидкість: ${session.interval} сек\nЗатемнення: ${labels.darkness[session.darkness]}\nВіньєтка: ${labels.vignette[session.vignette]}\nПорядок: ${labels.order[session.orderMode]}\nФормат: ${labels.format[session.format]}\nWatermark: немає`, confirmKeyboard);
+}
+function shuffled<T>(values: T[]) {
+  const out = [...values];
+  for (let i = out.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [out[i], out[j]] = [out[j], out[i]]; }
+  return out;
+}
+function splitBatchImages(keys: string[], count: number) {
+  const pool = shuffled(keys); const groups = Array.from({ length: count }, () => [] as string[]);
+  for (let i = 0; i < count * 4; i++) groups[i % count].push(pool[i]);
+  for (let i = count * 4; i < Math.min(pool.length, count * 5); i++) groups[i - count * 4].push(pool[i]);
+  return groups;
 }
 async function startRender(env: Env, chatId: number) {
   const session = await getSession(env, chatId);
   if (!session || session.step !== "confirm" || !session.duration || !session.interval || !session.darkness || !session.vignette || !session.orderMode || !session.format || !session.effect || !session.templateName) return;
   session.imageKeys = await resolveImageKeys(env, chatId, session);
-  if (session.imageKeys.length < 4) return sendMessage(env, chatId, "Фото не знайдено. Почни створення заново й надішли 4–10 фото.", createKeyboard);
+  const batchCount = session.batchCount || 1;
+  const minPhotos = session.batchCount ? batchCount * 4 : 4;
+  if (session.imageKeys.length < minPhotos) return sendMessage(env, chatId, `Фото не знайдено. Потрібно щонайменше ${minPhotos}.`, createKeyboard);
   const limit = await checkDailyLimit(env, chatId);
-  if (!limit.allowed) return sendMessage(env, chatId, "⛔ Денний ліміт у 5 відео вичерпано. Спробуй після опівночі за Києвом.");
+  if (!limit.premiumUntil && limit.left < batchCount) return sendMessage(env, chatId, `⛔ Недостатньо генерацій. Потрібно <b>${batchCount}</b>, залишилося <b>${limit.left}</b>.`);
   if (await env.SESSIONS.get(`active-job:${chatId}`)) return sendMessage(env, chatId, "У тебе вже є активна генерація.");
-  const jobId = crypto.randomUUID();
-  const pending = Number((await env.SESSIONS.get("queue:pending")) || 0) + 1;
-  const status = await sendMessage(env, chatId, "⚙️ <b>Працюю…</b>") as { message_id: number };
-  session.step = "rendering"; await putSession(env, chatId, session); await consumeDailyLimit(env, chatId);
-  const counterKey = isAdmin(env, chatId) ? undefined : dailyKey(chatId);
-  const job: RenderJob = { jobId, chatId, imageKeys: session.imageKeys, duration: session.duration, interval: session.interval, darkness: session.darkness, vignette: session.vignette, orderMode: session.orderMode, format: session.format, effect: session.effect, templateName: session.templateName, statusMessageId: status.message_id, dailyCounterKey: counterKey, queuedAt: Date.now() };
-  const jobToken = crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "");
+  const groups = session.batchCount ? splitBatchImages(session.imageKeys, batchCount) : [session.imageKeys.slice(0, 10)];
+  const pending = Number((await env.SESSIONS.get("queue:pending")) || 0) + groups.length;
+  session.step = "rendering"; await putSession(env, chatId, session); await consumeDailyLimit(env, chatId, groups.length);
+  const counterKey = limit.premiumUntil ? undefined : dailyKey(chatId);
+  const jobs: Array<{ job: RenderJob; token: string }> = [];
+  for (let i = 0; i < groups.length; i++) {
+    const jobId = crypto.randomUUID();
+    const status = await sendMessage(env, chatId, groups.length > 1 ? `⚙️ <b>Працюю… ${i + 1}/${groups.length}</b>` : "⚙️ <b>Працюю…</b>") as { message_id: number };
+    const job: RenderJob = { jobId, chatId, imageKeys: groups[i], duration: session.duration, interval: session.interval, darkness: session.darkness, vignette: session.vignette, orderMode: session.orderMode, format: session.format, effect: session.effect, templateName: session.templateName, statusMessageId: status.message_id, dailyCounterKey: counterKey, queuedAt: Date.now() };
+    jobs.push({ job, token: crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "") });
+  }
   await Promise.all([
-    env.SESSIONS.put(`job:${jobId}`, JSON.stringify({ status: "queued", chatId }), { expirationTtl: 86400 }),
-    env.SESSIONS.put(`render-job:${jobId}`, JSON.stringify({ job, token: jobToken }), { expirationTtl: 86400 }),
-    env.SESSIONS.put(`active-job:${chatId}`, jobId, { expirationTtl: 3600 }),
+    ...jobs.flatMap(({ job, token }) => [
+      env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "queued", chatId }), { expirationTtl: 86400 }),
+      env.SESSIONS.put(`render-job:${job.jobId}`, JSON.stringify({ job, token }), { expirationTtl: 86400 }),
+    ]),
+    env.SESSIONS.put(`active-job:${chatId}`, jobs[0].job.jobId, { expirationTtl: 3600 }),
     env.SESSIONS.put("queue:pending", String(pending)),
   ]);
-  try {
-    await dispatchGitHubRender(env, jobId, jobToken);
-  } catch (error) {
-    await failRender(env, job, `Не вдалося запустити GitHub Actions: ${String(error)}`);
-    return;
-  }
-  await Promise.all([incMetric(env, "total_jobs"), incDailyMetric(env, "queued"), incMetric(env, `format:${session.format}`), incMetric(env, `template:${session.templateName}`), incMetric(env, `darkness:${session.darkness}`), incMetric(env, `vignette:${session.vignette}`), incMetric(env, `order:${session.orderMode}`)]);
+  const dispatched = await Promise.allSettled(jobs.map(({ job, token }) => dispatchGitHubRender(env, job.jobId, token)));
+  for (let i = 0; i < dispatched.length; i++) if (dispatched[i].status === "rejected") await failRender(env, jobs[i].job, `Не вдалося запустити GitHub Actions: ${String((dispatched[i] as PromiseRejectedResult).reason)}`);
+  await Promise.all([incMetric(env, "total_jobs", groups.length), incDailyMetric(env, "queued", groups.length), incMetric(env, `format:${session.format}`, groups.length), incMetric(env, `template:${session.templateName}`, groups.length), incMetric(env, `darkness:${session.darkness}`, groups.length), incMetric(env, `vignette:${session.vignette}`, groups.length), incMetric(env, `order:${session.orderMode}`, groups.length)]);
   if (pending >= QUEUE_ALERT_THRESHOLD) await alertAdmins(env, `Черга досягла ${pending} завдань.`);
 }
 async function askUserTemplateName(env: Env, chatId: number) {
@@ -527,15 +594,79 @@ async function promptTemplateName(env: Env, chatId: number, id: string, action: 
   await putSession(env, chatId, { step: action, imageKeys: [], actionTemplateId: id });
   await sendMessage(env, chatId, action === "template_rename" ? "Надішли нову назву шаблону:" : "Надішли назву копії:");
 }
+async function registerReferral(env: Env, userId: number, payload: string) {
+  const match = payload.match(/^ref_(\d+)$/);
+  if (!match) return;
+  const referrerId = Number(match[1]);
+  if (!referrerId || referrerId === userId) return;
+  const user = await env.SESSIONS.get<StoredUser>(userKey(userId), "json");
+  if (!user || user.referrerId || user.referralQualified) return;
+  user.referrerId = referrerId;
+  await env.SESSIONS.put(userKey(userId), JSON.stringify(user));
+}
+async function qualifyReferral(env: Env, userId: number) {
+  const user = await env.SESSIONS.get<StoredUser>(userKey(userId), "json");
+  if (!user?.referrerId || user.referralQualified) return;
+  user.referralQualified = true;
+  await Promise.all([
+    env.SESSIONS.put(userKey(userId), JSON.stringify(user)),
+    addLimitBoost(env, user.referrerId, 2, 30, `referral:${userId}`),
+    incMetric(env, "qualified_referrals"),
+  ]);
+  try { await sendMessage(env, user.referrerId, "🎁 Друг створив перше відео! Твій денний ліміт збільшено на <b>+2 відео</b> протягом 30 днів."); } catch {}
+}
+async function showReferral(env: Env, chatId: number) {
+  const link = `https://t.me/${BOT_USERNAME}?start=ref_${chatId}`;
+  const boosts = (await activeBoosts(env, chatId)).filter((item) => item.source.startsWith("referral:"));
+  await sendMessage(env, chatId, `<b>🎁 Реферальна програма</b>\n\nЗапроси друга. Коли він створить перше відео, ти отримаєш <b>+2 відео щодня на 30 днів</b>.\n\nТвоє посилання:\n<code>${link}</code>\n\nАктивних бонусів: <b>${boosts.length}</b>.`, { inline_keyboard: [[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]] });
+}
+async function buyPremium(env: Env, chatId: number) {
+  await telegram(env, "sendInvoice", {
+    chat_id: chatId,
+    title: "Безліміт на 30 днів",
+    description: "Необмежене створення відео протягом 30 днів.",
+    payload: `premium30:${chatId}`,
+    currency: "XTR",
+    prices: [{ label: "Безліміт на 30 днів", amount: PREMIUM_STARS }],
+  });
+}
+async function askPromo(env: Env, chatId: number) {
+  await putSession(env, chatId, { step: "promo_input", imageKeys: [] });
+  await sendMessage(env, chatId, "Надішли промокод одним повідомленням:");
+}
+async function redeemPromo(env: Env, userId: number, rawCode: string) {
+  const code = rawCode.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, "");
+  const key = `promo:${code}`;
+  const promo = await env.SESSIONS.get<PromoCode>(key, "json");
+  if (!promo) return sendMessage(env, userId, "❌ Промокод не знайдено.", createKeyboard);
+  if (promo.usedBy.includes(userId)) return sendMessage(env, userId, "Цей промокод уже активовано тобою.", createKeyboard);
+  if (promo.usedBy.length >= promo.maxUses) return sendMessage(env, userId, "Термін використання промокоду завершено.", createKeyboard);
+  promo.usedBy.push(userId);
+  if (promo.type === "premium") await grantPremium(env, userId, promo.value);
+  else await addLimitBoost(env, userId, promo.value, 30, `promo:${code}`);
+  await Promise.all([env.SESSIONS.put(key, JSON.stringify(promo)), env.SESSIONS.delete(sessionKey(userId)), incMetric(env, "promo_redemptions")]);
+  await sendMessage(env, userId, promo.type === "premium" ? `✅ Активовано безліміт на <b>${promo.value} днів</b>.` : `✅ Денний ліміт збільшено на <b>+${promo.value}</b> протягом 30 днів.`, createKeyboard);
+}
+async function askFeedback(env: Env, chatId: number, jobId: string) {
+  await putSession(env, chatId, { step: "feedback_input", imageKeys: [], feedbackJobId: jobId });
+  await sendMessage(env, chatId, "Опиши проблему з відео одним повідомленням. Я передам її адміністратору.");
+}
+async function saveFeedback(env: Env, chatId: number, session: Session, text: string) {
+  const item = { at: new Date().toISOString(), userId: chatId, jobId: session.feedbackJobId, text: text.slice(0, 1000) };
+  const list = ((await env.SESSIONS.get("admin:feedback", "json")) as typeof item[] | null) || [];
+  await Promise.all([env.SESSIONS.put("admin:feedback", JSON.stringify([item, ...list].slice(0, 100))), env.SESSIONS.delete(sessionKey(chatId)), alertAdmins(env, `Скарга на відео ${session.feedbackJobId || ""} від ${chatId}: ${item.text}`)]);
+  await sendMessage(env, chatId, "✅ Повідомлення передано. Дякую!", createKeyboard);
+}
 async function showProfile(env: Env, chatId: number) {
   const limit = await checkDailyLimit(env, chatId);
   const ids = ((await env.SESSIONS.get(`user-templates:${chatId}:index`, "json")) as string[] | null) || [];
-  await sendMessage(env, chatId, `<b>👤 Мій профіль</b>\n\nTelegram ID: <code>${chatId}</code>\nЗалишилося відео сьогодні: <b>${limit.left}</b>\nПриватних шаблонів: <b>${ids.length}/20</b>\nWatermark: <b>немає</b>`, {
-    inline_keyboard: [[{ text: "📁 Мої шаблони", callback_data: "my_templates" }],[{ text: "🗑 Видалити мої дані", callback_data: "delete_my_data" }],[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]],
+  const status = limit.premiumUntil ? `⭐ Безліміт до ${new Date(limit.premiumUntil).toLocaleDateString("uk-UA", { timeZone: "Europe/Kyiv" })}` : `Залишилося сьогодні: <b>${limit.left}/${limit.limit}</b>`;
+  await sendMessage(env, chatId, `<b>👤 Мій профіль</b>\n\nTelegram ID: <code>${chatId}</code>\n${status}\nПриватних шаблонів: <b>${ids.length}/20</b>\nWatermark: <b>немає</b>`, {
+    inline_keyboard: [[{ text: "⭐ Купити безліміт", callback_data: "buy_premium" }],[{ text: "🎁 Реферальна програма", callback_data: "referral" }, { text: "🎟 Промокод", callback_data: "promo" }],[{ text: "📁 Мої шаблони", callback_data: "my_templates" }],[{ text: "🗑 Видалити мої дані", callback_data: "delete_my_data" }],[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]],
   });
 }
 async function showHelp(env: Env, chatId: number) {
-  await sendMessage(env, chatId, "<b>ℹ️ Допомога</b>\n\n1. Натисни «Створити слайд-шоу».\n2. Завантаж 4–10 фото.\n3. Обери свій шаблон або налаштуй відео.\n4. Натисни «Створити».\n\nУсі функції доступні кнопками.", { inline_keyboard: [[{ text: "🎞 Створити", callback_data: "create" }],[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]] });
+  await sendMessage(env, chatId, "<b>ℹ️ Допомога</b>\n\n• Одне відео: завантаж 4–10 фото.\n• Декілька відео: обери 3–6 та завантаж 4–5 фото на кожне.\n• Безкоштовно: 10 відео на день.\n• Безліміт на 30 днів: 100 Stars.\n\nУсі функції доступні кнопками.", { inline_keyboard: [[{ text: "🎞 Створити", callback_data: "create" }, { text: "🎬 Декілька", callback_data: "batch_create" }],[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]] });
 }
 async function promptAdmin(env: Env, chatId: number, action: Session["adminAction"]) {
   await putSession(env, chatId, { step: "admin_input", imageKeys: [], adminAction: action });
@@ -545,6 +676,8 @@ async function promptAdmin(env: Env, chatId: number, action: Session["adminActio
     block: "Надішли Telegram ID для блокування:",
     unblock: "Надішли Telegram ID для розблокування:",
     broadcast: "Надішли текст розсилки:",
+    premium: "Надішли: <code>USER_ID КІЛЬКІСТЬ_ДНІВ</code>, наприклад <code>123456 30</code>",
+    promo: "Надішли: <code>КОД ТИП ЗНАЧЕННЯ ВИКОРИСТАНЬ</code>\nТипи: <code>PREMIUM</code> (дні) або <code>VIDEOS</code> (+відео щодня на 30 днів).\nПриклад: <code>SALE PREMIUM 30 100</code>",
   };
   await sendMessage(env, chatId, prompts[action!], { inline_keyboard: [[{ text: "⬅️ В адмін-панель", callback_data: "admin:home" }]] });
 }
@@ -555,6 +688,17 @@ async function handleAdminInput(env: Env, chatId: number, session: Session, text
   else if (action === "block") await setBlocked(env, chatId, Number(text), true);
   else if (action === "unblock") await setBlocked(env, chatId, Number(text), false);
   else if (action === "broadcast") await broadcast(env, chatId, text);
+  else if (action === "premium") {
+    const [idRaw, daysRaw] = text.trim().split(/\s+/); const id = Number(idRaw); const days = Number(daysRaw || 30);
+    if (!id || !days) await sendMessage(env, chatId, "Неправильний формат.", adminKeyboard);
+    else { await grantPremium(env, id, days); await sendMessage(env, chatId, `✅ Користувачу <code>${id}</code> видано безліміт на <b>${days} днів</b>.`, adminKeyboard); }
+  }
+  else if (action === "promo") {
+    const [codeRaw, typeRaw, valueRaw, usesRaw] = text.trim().split(/\s+/);
+    const code = (codeRaw || "").toUpperCase().replace(/[^A-Z0-9_-]/g, ""); const type = typeRaw?.toLowerCase(); const value = Number(valueRaw); const maxUses = Number(usesRaw);
+    if (!code || !["premium", "videos"].includes(type) || value <= 0 || maxUses <= 0) await sendMessage(env, chatId, "Неправильний формат промокоду.", adminKeyboard);
+    else { const promo: PromoCode = { code, type: type as PromoCode["type"], value, maxUses, usedBy: [] }; await env.SESSIONS.put(`promo:${code}`, JSON.stringify(promo)); await sendMessage(env, chatId, `✅ Промокод <code>${code}</code> створено.`, adminKeyboard); }
+  }
   await env.SESSIONS.delete(sessionKey(chatId));
 }
 async function cancel(env: Env, chatId: number) {
@@ -651,17 +795,24 @@ async function deleteMyData(env: Env, chatId: number) {
   await Promise.all([
     ...ids.map((id) => env.SESSIONS.delete(`user-template:${chatId}:${id}`)),
     env.SESSIONS.delete(indexKey), env.SESSIONS.delete(sessionKey(chatId)), env.SESSIONS.delete(userKey(chatId)),
-    env.SESSIONS.delete(dailyKey(chatId)), deletePrefix(env, `uploads/${chatId}/`), deletePrefix(env, `outputs/${chatId}/`),
+    env.SESSIONS.delete(dailyKey(chatId)), env.SESSIONS.delete(`premium:${chatId}`), env.SESSIONS.delete(`limit-boosts:${chatId}`),
+    deletePrefix(env, `uploads/${chatId}/`), deletePrefix(env, `outputs/${chatId}/`),
   ]);
   await sendMessage(env, chatId, "✅ Твої файли, шаблони, сесія та профіль видалені.");
 }
 
 async function handleUpdate(env: Env, update: TelegramUpdate) {
   const callback = update.callback_query;
-  const user = callback?.from || update.message?.from;
+  const checkout = update.pre_checkout_query;
+  const user = callback?.from || checkout?.from || update.message?.from;
   await registerUser(env, user);
+  if (checkout) {
+    const valid = checkout.currency === "XTR" && checkout.total_amount === PREMIUM_STARS && checkout.invoice_payload === `premium30:${checkout.from.id}`;
+    await telegram(env, "answerPreCheckoutQuery", { pre_checkout_query_id: checkout.id, ok: valid, ...(valid ? {} : { error_message: "Неправильні параметри платежу." }) });
+    return;
+  }
   if (user && await isBlocked(env, user.id) && !isAdmin(env, user.id)) return;
-  if (user && !await rateAllowed(env, user.id)) return sendMessage(env, user.id, "Забагато дій. Спробуй через хвилину.");
+  if (user && !update.message?.photo?.length && !await rateAllowed(env, user.id)) return sendMessage(env, user.id, "Забагато дій. Спробуй через хвилину.");
   if (user && !isAdmin(env, user.id) && await env.SESSIONS.get("admin:maintenance") === "1") return sendMessage(env, user.id, "🔧 Бот тимчасово оновлюється. Спробуй пізніше.");
   if (callback?.message) {
     const chatId = callback.message.chat.id; const data = callback.data || "";
@@ -681,11 +832,21 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
       if (data === "admin:block") return promptAdmin(env, chatId, "block");
       if (data === "admin:unblock") return promptAdmin(env, chatId, "unblock");
       if (data === "admin:broadcast") return promptAdmin(env, chatId, "broadcast");
+      if (data === "admin:premium") return promptAdmin(env, chatId, "premium");
+      if (data === "admin:promo") return promptAdmin(env, chatId, "promo");
     }
     if (data === "main_menu") return sendMessage(env, chatId, "<b>Головне меню</b>", createKeyboard);
+    if (data === "batch_create") return sendMessage(env, chatId, "Скільки різних відео створити?", batchCountKeyboard);
+    if (data.startsWith("batch_count:")) return resetBatchSession(env, chatId, Number(data.split(":")[1]));
+    if (data === "buy_premium") return buyPremium(env, chatId);
+    if (data === "referral") return showReferral(env, chatId);
+    if (data === "promo") return askPromo(env, chatId);
+    if (data.startsWith("rate:")) { const [, value, jobId] = data.split(":"); await env.SESSIONS.put(`rating:${jobId}:${chatId}`, value, { expirationTtl: 90 * 86400 }); await incMetric(env, `rating:${value}`); return sendMessage(env, chatId, value === "up" ? "👍 Дякую за оцінку!" : "👎 Дякую. Можеш також описати проблему кнопкою нижче."); }
+    if (data.startsWith("report:")) return askFeedback(env, chatId, data.split(":")[1]);
     if (data === "profile") return showProfile(env, chatId);
     if (data === "help") return showHelp(env, chatId);
     if (data === "create") return resetSession(env, chatId);
+    if (data === "photos_restart") { const current = await getSession(env, chatId); return current?.batchCount ? resetBatchSession(env, chatId, current.batchCount) : resetSession(env, chatId); }
     if (data === "back") return goBack(env, chatId);
     if (data.startsWith("cancel_job:")) return cancelJob(env, chatId, data.split(":")[1]);
     if (data === "delete_my_data") return sendMessage(env, chatId, "⚠️ Видалити всі твої файли, шаблони та дані?", { inline_keyboard: [[{ text: "Так, видалити", callback_data: "delete_my_data_confirm" }],[{ text: "Ні", callback_data: "main_menu" }]] });
@@ -717,10 +878,15 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
   }
   const message = update.message; if (!message) return;
   const chatId = message.chat.id; const userId = message.from?.id || chatId;
+  if (message.successful_payment?.invoice_payload === `premium30:${userId}` && message.successful_payment.currency === "XTR" && message.successful_payment.total_amount === PREMIUM_STARS) {
+    const until = await grantPremium(env, userId, PREMIUM_DAYS); await incMetric(env, "premium_purchases");
+    return sendMessage(env, chatId, `⭐ Безліміт активовано до <b>${new Date(until).toLocaleDateString("uk-UA", { timeZone: "Europe/Kyiv" })}</b>.`, createKeyboard);
+  }
   if (message.text && await handleAdminCommand(env, chatId, userId, message.text)) return;
-  if (message.text === "/start") {
+  if (message.text?.startsWith("/start")) {
+    const payload = message.text.trim().split(/\s+/)[1] || ""; await registerReferral(env, userId, payload);
     const limit = await checkDailyLimit(env, userId);
-    return sendMessage(env, chatId, `Привіт! Я створюю слайд-шоу без watermark. Доступно <b>5 відео на день</b>.\nСьогодні залишилося: <b>${limit.left}</b>.`, createKeyboard);
+    return sendMessage(env, chatId, `Привіт! Я створюю слайд-шоу без watermark. Безкоштовно доступно <b>10 відео на день</b>.\nСьогодні залишилося: <b>${leftLabel(limit)}</b>.`, createKeyboard);
   }
   if (message.photo?.length) return acceptPhoto(env, chatId, message.photo, message.media_group_id);
   if (message.text) {
@@ -729,15 +895,18 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
     if (session?.step === "template_copy" && session.actionTemplateId) { await copyUserTemplate(env, chatId, session.actionTemplateId, message.text); await env.SESSIONS.delete(sessionKey(chatId)); return listUserTemplates(env, chatId); }
     if (session?.step === "admin_input" && isAdmin(env, userId)) return handleAdminInput(env, chatId, session, message.text);
     if (session?.step === "template_name") return saveUserTemplate(env, chatId, message.text);
+    if (session?.step === "promo_input") return redeemPromo(env, chatId, message.text);
+    if (session?.step === "feedback_input") return saveFeedback(env, chatId, session, message.text);
     if (session?.step === "duration") return setDuration(env, chatId, value);
     if (session?.step === "speed") return setSpeed(env, chatId, value);
   }
   await sendMessage(env, chatId, "Скористайся кнопкою нижче.", createKeyboard);
 }
 
-async function sendVideo(env: Env, chatId: number, video: ArrayBuffer, duration: number) {
+async function sendVideo(env: Env, chatId: number, video: ArrayBuffer, duration: number, jobId: string) {
   const form = new FormData(); form.append("chat_id", String(chatId)); form.append("supports_streaming", "true");
   form.append("caption", `✅ Готово: ${duration} сек`);
+  form.append("reply_markup", JSON.stringify({ inline_keyboard: [[{ text: "👍", callback_data: `rate:up:${jobId}` }, { text: "👎", callback_data: `rate:down:${jobId}` }], [{ text: "⚠️ Повідомити про проблему", callback_data: `report:${jobId}` }]] }));
   form.append("video", new Blob([video], { type: "video/mp4" }), "tiktok-creo.mp4");
   const response = await fetch(apiUrl(env, "sendVideo"), { method: "POST", body: form });
   const result = (await response.json()) as { ok: boolean; description?: string };
@@ -801,7 +970,7 @@ async function completeRender(env: Env, stored: StoredRenderJob, request: Reques
   const video = await request.arrayBuffer();
   await Promise.all([
     env.MEDIA.put(outputKey, video, { httpMetadata: { contentType: "video/mp4" } }),
-    sendVideo(env, job.chatId, video, job.duration),
+    sendVideo(env, job.chatId, video, job.duration, job.jobId),
   ]);
   const renderMs = Date.now() - job.queuedAt;
   await Promise.all([
@@ -812,6 +981,7 @@ async function completeRender(env: Env, stored: StoredRenderJob, request: Reques
     incMetric(env, "output_bytes", video.byteLength), incDailyMetric(env, "completed"), incDailyMetric(env, "render_ms", renderMs),
     incDailyMetric(env, "output_bytes", video.byteLength),
   ]);
+  await qualifyReferral(env, job.chatId);
   await sendMessage(env, job.chatId, "Можеш створити наступне відео 👇", createKeyboard);
   return json({ ok: true });
 }

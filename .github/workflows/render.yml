@@ -29,8 +29,10 @@ jobs:
         run: |
           echo "::add-mask::$JOB_TOKEN"
       - uses: actions/checkout@v4
-      - name: Check FFmpeg
+      - name: Install FFmpeg
         run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
           ffmpeg -version | head -n 1
       - name: Download job
         run: |

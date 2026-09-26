@@ -1,13 +1,12 @@
-import { Container } from "@cloudflare/containers";
-
 interface Env {
   TELEGRAM_BOT_TOKEN: string;
   WEBHOOK_SECRET: string;
   ADMIN_TELEGRAM_IDS?: string;
   SESSIONS: KVNamespace;
   MEDIA: R2Bucket;
-  RENDER_QUEUE: Queue<RenderJob>;
-  RENDER_CONTAINER: DurableObjectNamespace;
+  GITHUB_TOKEN: string;
+  GITHUB_REPOSITORY: string;
+  WORKER_BASE_URL: string;
 }
 
 type Step = "photos" | "template" | "duration" | "speed" | "darkness" | "vignette" | "order" | "effect" | "format" | "confirm" | "template_name" | "template_rename" | "template_copy" | "admin_input" | "rendering";
@@ -70,12 +69,6 @@ interface SavedSettings {
   orderMode: OrderMode; format: VideoFormat; effect: Effect; templateName: TemplateName;
 }
 interface UserTemplate { id: string; ownerId: number; name: string; settings: SavedSettings; createdAt: string }
-
-export class RenderContainer extends Container {
-  defaultPort = 8080;
-  sleepAfter = "2m";
-  override onError(error: unknown) { console.error("Render container error", error); }
-}
 
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), {
   status,
@@ -364,12 +357,19 @@ async function startRender(env: Env, chatId: number) {
   session.step = "rendering"; await putSession(env, chatId, session); await consumeDailyLimit(env, chatId);
   const counterKey = isAdmin(env, chatId) ? undefined : dailyKey(chatId);
   const job: RenderJob = { jobId, chatId, imageKeys: session.imageKeys, duration: session.duration, interval: session.interval, darkness: session.darkness, vignette: session.vignette, orderMode: session.orderMode, format: session.format, effect: session.effect, templateName: session.templateName, statusMessageId: status.message_id, dailyCounterKey: counterKey, queuedAt: Date.now() };
+  const jobToken = crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "");
   await Promise.all([
     env.SESSIONS.put(`job:${jobId}`, JSON.stringify({ status: "queued", chatId }), { expirationTtl: 86400 }),
+    env.SESSIONS.put(`render-job:${jobId}`, JSON.stringify({ job, token: jobToken }), { expirationTtl: 86400 }),
     env.SESSIONS.put(`active-job:${chatId}`, jobId, { expirationTtl: 3600 }),
     env.SESSIONS.put("queue:pending", String(pending)),
   ]);
-  await env.RENDER_QUEUE.send(job);
+  try {
+    await dispatchGitHubRender(env, jobId, jobToken);
+  } catch (error) {
+    await failRender(env, job, `Не вдалося запустити GitHub Actions: ${String(error)}`);
+    return;
+  }
   await Promise.all([incMetric(env, "total_jobs"), incDailyMetric(env, "queued"), incMetric(env, `format:${session.format}`), incMetric(env, `template:${session.templateName}`), incMetric(env, `darkness:${session.darkness}`), incMetric(env, `vignette:${session.vignette}`), incMetric(env, `order:${session.orderMode}`)]);
   if (pending >= QUEUE_ALERT_THRESHOLD) await alertAdmins(env, `Черга досягла ${pending} завдань.`);
 }
@@ -705,40 +705,69 @@ async function sendVideo(env: Env, chatId: number, video: ArrayBuffer, duration:
   const result = (await response.json()) as { ok: boolean; description?: string };
   if (!result.ok) throw new Error(result.description || "Telegram sendVideo failed");
 }
-async function renderJob(env: Env, job: RenderJob) {
-  const startedAt = Date.now();
+interface StoredRenderJob { job: RenderJob; token: string }
+async function dispatchGitHubRender(env: Env, jobId: string, jobToken: string) {
+  const response = await fetch(`https://api.github.com/repos/${env.GITHUB_REPOSITORY}/actions/workflows/render.yml/dispatches`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.GITHUB_TOKEN}`,
+      accept: "application/vnd.github+json",
+      "x-github-api-version": "2022-11-28",
+      "user-agent": "tiktok-creo-bot",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ ref: "main", inputs: { job_id: jobId, job_token: jobToken, worker_url: env.WORKER_BASE_URL } }),
+  });
+  if (!response.ok) throw new Error(`GitHub ${response.status}: ${(await response.text()).slice(0, 500)}`);
+}
+async function loadRenderJob(env: Env, jobId: string, token: string | null) {
+  if (!token) return null;
+  const stored = await env.SESSIONS.get<StoredRenderJob>(`render-job:${jobId}`, "json");
+  if (!stored || stored.token !== token) return null;
+  return stored;
+}
+async function decrementPending(env: Env) {
   const pending = Math.max(0, Number((await env.SESSIONS.get("queue:pending")) || 1) - 1);
   await env.SESSIONS.put("queue:pending", String(pending));
+}
+async function failRender(env: Env, job: RenderJob, detail: string) {
+  const state = await env.SESSIONS.get<{status:string}>(`job:${job.jobId}`, "json");
+  if (state?.status === "failed" || state?.status === "done") return;
+  await Promise.all([
+    decrementPending(env), removeImages(env, job.imageKeys), env.SESSIONS.delete(sessionKey(job.chatId)),
+    env.SESSIONS.delete(`active-job:${job.chatId}`), env.SESSIONS.delete(`render-job:${job.jobId}`),
+    refundDailyLimit(env, job.dailyCounterKey),
+    env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "failed", chatId: job.chatId }), { expirationTtl: 86400 }),
+    incMetric(env, "failed"), incDailyMetric(env, "failed"), recordError(env, "github_render", detail),
+  ]);
+  await Promise.all([
+    editMessage(env, job.chatId, job.statusMessageId, "❌ <b>Не вдалося створити відео. Ліміт повернуто.</b>"),
+    sendMessage(env, job.chatId, "Спробуй ще раз трохи пізніше 👇", createKeyboard),
+    alertAdmins(env, `Рендер ${job.jobId} завершився помилкою: ${detail}`),
+  ]);
+}
+async function completeRender(env: Env, stored: StoredRenderJob, request: Request) {
+  const { job } = stored;
   const state = await env.SESSIONS.get<{status:string}>(`job:${job.jobId}`, "json");
   if (state?.status === "cancelled") {
-    await Promise.all([removeImages(env, job.imageKeys), refundDailyLimit(env, job.dailyCounterKey), env.SESSIONS.delete(`active-job:${job.chatId}`), env.SESSIONS.delete(sessionKey(job.chatId))]);
+    await Promise.all([decrementPending(env), removeImages(env, job.imageKeys), refundDailyLimit(env, job.dailyCounterKey), env.SESSIONS.delete(`active-job:${job.chatId}`), env.SESSIONS.delete(sessionKey(job.chatId)), env.SESSIONS.delete(`render-job:${job.jobId}`)]);
     await editMessage(env, job.chatId, job.statusMessageId, "❌ <b>Створення скасовано. Ліміт повернуто.</b>");
-    return;
+    return json({ ok: true, cancelled: true });
   }
-  await env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "rendering", chatId: job.chatId }), { expirationTtl: 86400 });
-  await editMessage(env, job.chatId, job.statusMessageId, "🎬 <b>Рендер відео…</b>");
-  const form = new FormData();
-  for (const [key, value] of Object.entries({ duration: job.duration, interval: job.interval, darkness: job.darkness, vignette: job.vignette, orderMode: job.orderMode, format: job.format, effect: job.effect })) form.append(key, String(value));
-  for (let i = 0; i < job.imageKeys.length; i++) {
-    const object = await env.MEDIA.get(job.imageKeys[i]); if (!object) throw new Error(`Missing image: ${job.imageKeys[i]}`);
-    form.append("images", new Blob([await object.arrayBuffer()], { type: object.httpMetadata?.contentType || "image/jpeg" }), `image-${i}.jpg`);
-  }
-  const container = env.RENDER_CONTAINER.getByName(`renderer-${Math.abs(job.chatId) % 3}`);
-  const response = await container.fetch("http://container/render", { method: "POST", body: form });
-  if (!response.ok) throw new Error(`Renderer ${response.status}: ${await response.text()}`);
-  const video = await response.arrayBuffer();
-  const latest = await env.SESSIONS.get<{status:string}>(`job:${job.jobId}`, "json");
-  if (latest?.status === "cancelled") {
-    await Promise.all([removeImages(env, job.imageKeys), refundDailyLimit(env, job.dailyCounterKey), env.SESSIONS.delete(`active-job:${job.chatId}`), env.SESSIONS.delete(sessionKey(job.chatId))]);
-    await editMessage(env, job.chatId, job.statusMessageId, "❌ <b>Створення скасовано. Ліміт повернуто.</b>");
-    return;
-  }
+  if (!request.body) return json({ error: "empty video" }, 400);
+  const contentLength = Number(request.headers.get("content-length") || 0);
+  if (contentLength > 50 * 1024 * 1024) return json({ error: "video too large" }, 413);
+  const outputKey = `outputs/${job.chatId}/${job.jobId}.mp4`;
+  await env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "uploading", chatId: job.chatId }), { expirationTtl: 86400 });
   await editMessage(env, job.chatId, job.statusMessageId, "📤 <b>Надсилання відео…</b>");
-  await env.MEDIA.put(`outputs/${job.chatId}/${job.jobId}.mp4`, video, { httpMetadata: { contentType: "video/mp4" } });
+  await env.MEDIA.put(outputKey, request.body, { httpMetadata: { contentType: "video/mp4" } });
+  const object = await env.MEDIA.get(outputKey); if (!object) throw new Error("Rendered video missing in R2");
+  const video = await object.arrayBuffer();
   await sendVideo(env, job.chatId, video, job.duration);
-  const renderMs = Date.now() - startedAt;
+  const renderMs = Date.now() - job.queuedAt;
   await Promise.all([
-    removeImages(env, job.imageKeys), env.SESSIONS.delete(sessionKey(job.chatId)), env.SESSIONS.delete(`active-job:${job.chatId}`),
+    decrementPending(env), removeImages(env, job.imageKeys), env.SESSIONS.delete(sessionKey(job.chatId)),
+    env.SESSIONS.delete(`active-job:${job.chatId}`), env.SESSIONS.delete(`render-job:${job.jobId}`),
     env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "done", chatId: job.chatId }), { expirationTtl: 86400 }),
     incMetric(env, "completed"), incMetric(env, "rendered_seconds", job.duration), incMetric(env, "render_ms", renderMs),
     incMetric(env, "output_bytes", video.byteLength), incDailyMetric(env, "completed"), incDailyMetric(env, "render_ms", renderMs),
@@ -746,7 +775,9 @@ async function renderJob(env: Env, job: RenderJob) {
   ]);
   await editMessage(env, job.chatId, job.statusMessageId, "✅ <b>Готово</b>");
   await sendMessage(env, job.chatId, "Можеш створити наступне відео 👇", createKeyboard);
+  return json({ ok: true });
 }
+
 async function cleanupStorage(env: Env) {
   const now = Date.now(); let cursor: string | undefined; let totalBytes = 0; let deleted = 0;
   do {
@@ -774,25 +805,33 @@ export default {
       ctx.waitUntil(handleUpdate(env, update).catch(async (error) => { console.error("Update failed", error); await recordError(env, "telegram_update", error); }));
       return json({ ok: true });
     }
-    return new Response("TikTok Creo Bot is running", { status: 200 });
-  },
-  async queue(batch: MessageBatch<RenderJob>, env: Env): Promise<void> {
-    for (const message of batch.messages) {
-      try { await renderJob(env, message.body); message.ack(); }
-      catch (error) {
-        console.error("Render failed", error); await recordError(env, "render", error);
-        if (message.attempts >= 3) {
-          await Promise.all([
-            sendMessage(env, message.body.chatId, "❌ Не вдалося створити відео. Ліміт повернуто.", createKeyboard),
-            removeImages(env, message.body.imageKeys), env.SESSIONS.delete(sessionKey(message.body.chatId)),
-            env.SESSIONS.delete(`active-job:${message.body.chatId}`), refundDailyLimit(env, message.body.dailyCounterKey),
-            env.SESSIONS.put(`job:${message.body.jobId}`, JSON.stringify({ status: "failed", chatId: message.body.chatId }), { expirationTtl: 86400 }),
-            incMetric(env, "failed"), incDailyMetric(env, "failed"), alertAdmins(env, `Рендер ${message.body.jobId} завершився помилкою: ${String(error)}`),
-          ]);
-          message.ack();
-        } else message.retry({ delaySeconds: 10 });
+    const match = url.pathname.match(/^\/github\/render\/([0-9a-f-]+)\/(job|image\/([0-9]+)|complete|failed)$/);
+    if (match) {
+      const [, jobId, action, imageIndex] = match;
+      const token = request.headers.get("X-Render-Token") || url.searchParams.get("token");
+      const stored = await loadRenderJob(env, jobId, token);
+      if (!stored) return json({ error: "unauthorized" }, 401);
+      if (action === "job" && request.method === "GET") {
+        await env.SESSIONS.put(`job:${jobId}`, JSON.stringify({ status: "rendering", chatId: stored.job.chatId }), { expirationTtl: 86400 });
+        await editMessage(env, stored.job.chatId, stored.job.statusMessageId, "🎬 <b>Рендер відео через GitHub Actions…</b>");
+        return json({ ...stored.job, imageCount: stored.job.imageKeys.length, imageKeys: undefined, dailyCounterKey: undefined });
       }
+      if (action.startsWith("image/") && request.method === "GET") {
+        const index = Number(imageIndex); const key = stored.job.imageKeys[index];
+        if (!key) return json({ error: "image not found" }, 404);
+        const object = await env.MEDIA.get(key); if (!object) return json({ error: "image missing" }, 404);
+        return new Response(object.body, { headers: { "content-type": object.httpMetadata?.contentType || "image/jpeg" } });
+      }
+      if (action === "complete" && request.method === "POST") {
+        try { return await completeRender(env, stored, request); }
+        catch (error) { await failRender(env, stored.job, String(error)); return json({ error: "completion failed" }, 500); }
+      }
+      if (action === "failed" && request.method === "POST") {
+        const body = await request.text(); await failRender(env, stored.job, body.slice(0, 1000)); return json({ ok: true });
+      }
+      return json({ error: "method not allowed" }, 405);
     }
+    return new Response("TikTok Creo Bot is running", { status: 200 });
   },
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     await cleanupStorage(env);

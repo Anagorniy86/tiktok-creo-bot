@@ -1,0 +1,41 @@
+name: Render TikTok video
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        required: true
+        type: string
+      job_token:
+        required: true
+        type: string
+      worker_url:
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: render-${{ inputs.job_id }}
+  cancel-in-progress: false
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+      JOB_TOKEN: ${{ inputs.job_token }}
+      WORKER_URL: ${{ inputs.worker_url }}
+    steps:
+      - name: Protect one-time token
+        run: echo "::add-mask::$JOB_TOKEN"
+      - uses: actions/checkout@v4
+      - name: Check FFmpeg
+        run: ffmpeg -version | head -n 1
+      - name: Download job
+        run: curl --fail --silent --show-error --retry 3 -H "X-Render-Token: $JOB_TOKEN" "$WORKER_URL/github/render/$JOB_ID/job" -o job.json
+      - name: Render video
+        run: node scripts/render-action.mjs job.json output.mp4 "$WORKER_URL" "$JOB_ID" "$JOB_TOKEN"
+      - name: Deliver video
+        run: curl --fail --silent --show-error --retry 2 -X POST -H "X-Render-Token: $JOB_TOKEN" -H "Content-Type: video/mp4" --data-binary @output.mp4 "$WORKER_URL/github/render/$JOB_ID/complete"
+      - name: Report failure
+        if: failure()
+        run: curl --silent --show-error --retry 2 -X POST -H "X-Render-Token: $JOB_TOKEN" -H "Content-Type: text/plain" --data "GitHub Actions workflow failed. Run $GITHUB_RUN_ID" "$WORKER_URL/github/render/$JOB_ID/failed" || true

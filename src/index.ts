@@ -20,7 +20,6 @@ type TemplateName = string;
 interface Session {
   step: Step;
   imageKeys: string[];
-  photoStatusMessageId?: number;
   duration?: number;
   interval?: number;
   darkness?: Darkness;
@@ -245,6 +244,12 @@ async function listAllUploadKeys(env: Env, chatId: number) {
 async function listUploadKeys(env: Env, chatId: number) {
   return (await listAllUploadKeys(env, chatId)).slice(0, 10);
 }
+async function resolveImageKeys(env: Env, chatId: number, session: Session) {
+  const listed = await listUploadKeys(env, chatId);
+  const candidates = [...new Set([...listed, ...session.imageKeys])].slice(0, 10);
+  const existing = await Promise.all(candidates.map(async (key) => await env.MEDIA.head(key) ? key : null));
+  return existing.filter((key): key is string => Boolean(key));
+}
 async function removeAllUploadImages(env: Env, chatId: number) {
   await removeImages(env, await listAllUploadKeys(env, chatId));
 }
@@ -270,9 +275,9 @@ async function resetSession(env: Env, chatId: number) {
   const limit = await checkDailyLimit(env, chatId);
   if (!limit.allowed) return sendMessage(env, chatId, "⛔ Денний ліміт вичерпано. Доступно <b>5 відео на день</b>. Ліміт оновиться опівночі за Києвом.");
   await removeAllUploadImages(env, chatId);
-  const status = await sendMessage(env, chatId, `Надішли <b>4–10 фото</b>. Коли завершиш — натисни «Далі».
-Сьогодні залишилося відео: <b>${limit.left}</b>`, photosKeyboard) as { message_id: number };
-  await putSession(env, chatId, { step: "photos", imageKeys: [], photoStatusMessageId: status.message_id });
+  await putSession(env, chatId, { step: "photos", imageKeys: [] });
+  await sendMessage(env, chatId, `Надішли <b>4–10 фото</b>. Коли завершиш — натисни «Далі».
+Сьогодні залишилося відео: <b>${limit.left}</b>`, photosKeyboard);
 }
 async function downloadTelegramPhoto(env: Env, fileId: string) {
   const result = (await telegram(env, "getFile", { file_id: fileId })) as { file_path: string };
@@ -290,23 +295,25 @@ async function acceptPhoto(env: Env, chatId: number, photos: Array<{ file_id: st
   if (data.byteLength > 15 * 1024 * 1024) return sendMessage(env, chatId, "Це фото завелике. Максимум — 15 МБ.");
   const key = `uploads/${chatId}/${crypto.randomUUID()}.${ext}`;
   await env.MEDIA.put(key, data, { httpMetadata: { contentType: `image/${ext === "jpg" ? "jpeg" : ext}` } });
-  if (mediaGroupId) await new Promise((resolve) => setTimeout(resolve, 800));
-  const keys = await listUploadKeys(env, chatId);
-  session.imageKeys = keys;
-  const count = keys.length;
-  const text = `Фото додано: <b>${count}/10</b>${count < 4 ? `\nПотрібно ще мінімум ${4 - count}.` : "\nМожна переходити далі."}`;
-  if (session.photoStatusMessageId) {
-    try { await editMessage(env, chatId, session.photoStatusMessageId, text, photosKeyboard); } catch {}
-  } else {
-    const status = await sendMessage(env, chatId, text, photosKeyboard) as { message_id: number };
-    session.photoStatusMessageId = status.message_id;
+  if (mediaGroupId) {
+    const markerKey = `album-markers/${chatId}/${mediaGroupId}`;
+    const marker = crypto.randomUUID();
+    await env.MEDIA.put(markerKey, marker);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    const currentMarker = await env.MEDIA.get(markerKey);
+    if (!currentMarker || await currentMarker.text() !== marker) return;
+    await env.MEDIA.delete(markerKey);
   }
+  const keys = await resolveImageKeys(env, chatId, session);
+  session.imageKeys = keys;
   await putSession(env, chatId, session);
+  const count = keys.length;
+  await sendMessage(env, chatId, `✅ Фото прийнято: <b>${count}/10</b>${count < 4 ? `\nПотрібно ще мінімум ${4 - count}.` : "\nМожна переходити далі."}`, photosKeyboard);
 }
 async function chooseCreationMode(env: Env, chatId: number) {
   const session = await getSession(env, chatId);
   if (!session) return sendMessage(env, chatId, "Спочатку натисни «Створити слайд-шоу».", createKeyboard);
-  session.imageKeys = await listUploadKeys(env, chatId);
+  session.imageKeys = await resolveImageKeys(env, chatId, session);
   if (session.imageKeys.length < 4) return sendMessage(env, chatId, `Знайдено <b>${session.imageKeys.length}</b> фото. Потрібно завантажити щонайменше 4.`, photosKeyboard);
   if (session.templatePreset && session.duration && session.interval && session.darkness && session.vignette && session.orderMode && session.format && session.effect && session.templateName) {
     session.step = "confirm"; await putSession(env, chatId, session); return showConfirmation(env, chatId, session);
@@ -376,16 +383,14 @@ async function showConfirmation(env: Env, chatId: number, session: Session) {
 async function startRender(env: Env, chatId: number) {
   const session = await getSession(env, chatId);
   if (!session || session.step !== "confirm" || !session.duration || !session.interval || !session.darkness || !session.vignette || !session.orderMode || !session.format || !session.effect || !session.templateName) return;
-  session.imageKeys = await listUploadKeys(env, chatId);
+  session.imageKeys = await resolveImageKeys(env, chatId, session);
   if (session.imageKeys.length < 4) return sendMessage(env, chatId, "Фото не знайдено. Почни створення заново й надішли 4–10 фото.", createKeyboard);
   const limit = await checkDailyLimit(env, chatId);
   if (!limit.allowed) return sendMessage(env, chatId, "⛔ Денний ліміт у 5 відео вичерпано. Спробуй після опівночі за Києвом.");
   if (await env.SESSIONS.get(`active-job:${chatId}`)) return sendMessage(env, chatId, "У тебе вже є активна генерація.");
   const jobId = crypto.randomUUID();
   const pending = Number((await env.SESSIONS.get("queue:pending")) || 0) + 1;
-  const status = await sendMessage(env, chatId, `🕒 <b>Завдання прийнято</b>\nПозиція в черзі: приблизно <b>${pending}</b>`, {
-    inline_keyboard: [[{ text: "❌ Скасувати створення", callback_data: `cancel_job:${jobId}` }]],
-  }) as { message_id: number };
+  const status = await sendMessage(env, chatId, "⚙️ <b>Працюю…</b>") as { message_id: number };
   session.step = "rendering"; await putSession(env, chatId, session); await consumeDailyLimit(env, chatId);
   const counterKey = isAdmin(env, chatId) ? undefined : dailyKey(chatId);
   const job: RenderJob = { jobId, chatId, imageKeys: session.imageKeys, duration: session.duration, interval: session.interval, darkness: session.darkness, vignette: session.vignette, orderMode: session.orderMode, format: session.format, effect: session.effect, templateName: session.templateName, statusMessageId: status.message_id, dailyCounterKey: counterKey, queuedAt: Date.now() };
@@ -493,8 +498,8 @@ async function startWithTemplate(env: Env, chatId: number, id: string) {
   if (!t) return listUserTemplates(env, chatId);
   const limit = await checkDailyLimit(env, chatId); if (!limit.allowed) return sendMessage(env, chatId, "Денний ліміт вичерпано.");
   await removeAllUploadImages(env, chatId);
-  const status = await sendMessage(env, chatId, `Шаблон <b>${escapeHtml(t.name)}</b> вибрано. Надішли 4–10 фото.`, photosKeyboard) as { message_id: number };
-  await putSession(env, chatId, { step: "photos", imageKeys: [], photoStatusMessageId: status.message_id, ...t.settings, templatePreset: true });
+  await putSession(env, chatId, { step: "photos", imageKeys: [], ...t.settings, templatePreset: true });
+  await sendMessage(env, chatId, `Шаблон <b>${escapeHtml(t.name)}</b> вибрано. Надішли 4–10 фото.`, photosKeyboard);
 }
 async function showTemplateEditor(env: Env, chatId: number, id: string) {
   await sendMessage(env, chatId, "Що змінити?", { inline_keyboard: [
@@ -792,11 +797,12 @@ async function completeRender(env: Env, stored: StoredRenderJob, request: Reques
   if (contentLength > 50 * 1024 * 1024) return json({ error: "video too large" }, 413);
   const outputKey = `outputs/${job.chatId}/${job.jobId}.mp4`;
   await env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "uploading", chatId: job.chatId }), { expirationTtl: 86400 });
-  await editMessage(env, job.chatId, job.statusMessageId, "📤 <b>Надсилання відео…</b>");
-  await env.MEDIA.put(outputKey, request.body, { httpMetadata: { contentType: "video/mp4" } });
-  const object = await env.MEDIA.get(outputKey); if (!object) throw new Error("Rendered video missing in R2");
-  const video = await object.arrayBuffer();
-  await sendVideo(env, job.chatId, video, job.duration);
+  await editMessage(env, job.chatId, job.statusMessageId, "📤 <b>Надсилаю…</b>");
+  const video = await request.arrayBuffer();
+  await Promise.all([
+    env.MEDIA.put(outputKey, video, { httpMetadata: { contentType: "video/mp4" } }),
+    sendVideo(env, job.chatId, video, job.duration),
+  ]);
   const renderMs = Date.now() - job.queuedAt;
   await Promise.all([
     decrementPending(env), removeImages(env, job.imageKeys), env.SESSIONS.delete(sessionKey(job.chatId)),
@@ -806,7 +812,6 @@ async function completeRender(env: Env, stored: StoredRenderJob, request: Reques
     incMetric(env, "output_bytes", video.byteLength), incDailyMetric(env, "completed"), incDailyMetric(env, "render_ms", renderMs),
     incDailyMetric(env, "output_bytes", video.byteLength),
   ]);
-  await editMessage(env, job.chatId, job.statusMessageId, "✅ <b>Готово</b>");
   await sendMessage(env, job.chatId, "Можеш створити наступне відео 👇", createKeyboard);
   return json({ ok: true });
 }
@@ -846,7 +851,6 @@ export default {
       if (!stored) return json({ error: "unauthorized" }, 401);
       if (action === "job" && request.method === "GET") {
         await env.SESSIONS.put(`job:${jobId}`, JSON.stringify({ status: "rendering", chatId: stored.job.chatId }), { expirationTtl: 86400 });
-        await editMessage(env, stored.job.chatId, stored.job.statusMessageId, "🎬 <b>Рендер відео через GitHub Actions…</b>");
         return json({ ...stored.job, imageCount: stored.job.imageKeys.length, imageKeys: undefined, dailyCounterKey: undefined });
       }
       if (action.startsWith("image/") && request.method === "GET") {

@@ -43,12 +43,13 @@ for (const [key, values] of Object.entries(allowed)) if (!values.includes(job[ke
 if (job.imageCount < 4 || job.imageCount > 10 || job.duration < 1 || job.duration > 60 || job.interval < 0.05 || job.interval > 2) throw new Error("Invalid job limits");
 const dir = await mkdtemp(join(tmpdir(), "creo-action-"));
 try {
-  const paths = [];
-  for (let i = 0; i < job.imageCount; i++) {
+  const paths = await Promise.all(Array.from({ length: job.imageCount }, async (_, i) => {
     const response = await fetch(`${workerUrl}/github/render/${jobId}/image/${i}`, { headers: { "X-Render-Token": token } });
     if (!response.ok) throw new Error(`Image ${i}: HTTP ${response.status}`);
-    const path = join(dir, `image-${i}.jpg`); await writeFile(path, Buffer.from(await response.arrayBuffer())); paths.push(path);
-  }
+    const path = join(dir, `image-${i}.jpg`);
+    await writeFile(path, Buffer.from(await response.arrayBuffer()));
+    return path;
+  }));
   const framesNeeded = Math.max(1, Math.ceil(job.duration / job.interval));
   const seq = sequence(paths.length, framesNeeded, job.orderMode);
   const [width, height] = formats[job.format];

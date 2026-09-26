@@ -21,6 +21,17 @@ function run(command, args) {
     child.on("error", reject); child.on("close", (code) => code === 0 ? resolve() : reject(new Error(`${command} exited ${code}: ${stderr.slice(-4000)}`)));
   });
 }
+
+function capture(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = ""; let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve(stdout.trim()) : reject(new Error(`${command} exited ${code}: ${stderr.slice(-4000)}`)));
+  });
+}
 function shuffle(values) { const out = [...values]; for (let i = out.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [out[i], out[j]] = [out[j], out[i]]; } return out; }
 function sequence(count, needed, mode) {
   const base = Array.from({ length: count }, (_, i) => i);
@@ -52,4 +63,6 @@ try {
   await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-framerate", (1 / job.interval).toFixed(6), "-start_number", "0", "-i", join(dir, "frame-%06d.jpg"), "-t", String(job.duration), "-vf", filter, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-movflags", "+faststart", outputPath]);
   const output = await stat(outputPath);
   if (output.size < 10 * 1024) throw new Error(`Rendered video is unexpectedly small: ${output.size} bytes`);
+  const duration = Number(await capture("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", outputPath]));
+  if (!Number.isFinite(duration) || duration < job.duration - 0.25) throw new Error(`Rendered duration is invalid: ${duration}s instead of ${job.duration}s`);
 } finally { await rm(dir, { recursive: true, force: true }); }

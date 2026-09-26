@@ -20,6 +20,7 @@ type TemplateName = string;
 interface Session {
   step: Step;
   imageKeys: string[];
+  photoStatusMessageId?: number;
   duration?: number;
   interval?: number;
   darkness?: Darkness;
@@ -269,9 +270,9 @@ async function resetSession(env: Env, chatId: number) {
   const limit = await checkDailyLimit(env, chatId);
   if (!limit.allowed) return sendMessage(env, chatId, "⛔ Денний ліміт вичерпано. Доступно <b>5 відео на день</b>. Ліміт оновиться опівночі за Києвом.");
   await removeAllUploadImages(env, chatId);
-  await putSession(env, chatId, { step: "photos", imageKeys: [] });
-  await sendMessage(env, chatId, `Надішли <b>4–10 фото</b>. Коли завершиш — натисни «Далі».
-Сьогодні залишилося відео: <b>${limit.left}</b>`, photosKeyboard);
+  const status = await sendMessage(env, chatId, `Надішли <b>4–10 фото</b>. Коли завершиш — натисни «Далі».
+Сьогодні залишилося відео: <b>${limit.left}</b>`, photosKeyboard) as { message_id: number };
+  await putSession(env, chatId, { step: "photos", imageKeys: [], photoStatusMessageId: status.message_id });
 }
 async function downloadTelegramPhoto(env: Env, fileId: string) {
   const result = (await telegram(env, "getFile", { file_id: fileId })) as { file_path: string };
@@ -280,7 +281,7 @@ async function downloadTelegramPhoto(env: Env, fileId: string) {
   const ext = result.file_path.split(".").pop()?.replace(/[^a-zA-Z0-9]/g, "") || "jpg";
   return { data: await response.arrayBuffer(), ext };
 }
-async function acceptPhoto(env: Env, chatId: number, photos: Array<{ file_id: string }>) {
+async function acceptPhoto(env: Env, chatId: number, photos: Array<{ file_id: string }>, mediaGroupId?: string) {
   const session = await getSession(env, chatId);
   if (!session || session.step !== "photos") return sendMessage(env, chatId, "Спочатку натисни «Створити слайд-шоу».", createKeyboard);
   const existingKeys = await listUploadKeys(env, chatId);
@@ -289,11 +290,18 @@ async function acceptPhoto(env: Env, chatId: number, photos: Array<{ file_id: st
   if (data.byteLength > 15 * 1024 * 1024) return sendMessage(env, chatId, "Це фото завелике. Максимум — 15 МБ.");
   const key = `uploads/${chatId}/${crypto.randomUUID()}.${ext}`;
   await env.MEDIA.put(key, data, { httpMetadata: { contentType: `image/${ext === "jpg" ? "jpeg" : ext}` } });
+  if (mediaGroupId) await new Promise((resolve) => setTimeout(resolve, 800));
   const keys = await listUploadKeys(env, chatId);
   session.imageKeys = keys;
-  await putSession(env, chatId, session);
   const count = keys.length;
-  await sendMessage(env, chatId, `Фото додано: <b>${count}/10</b>${count < 4 ? `\nПотрібно ще мінімум ${4 - count}.` : "\nМожна переходити далі."}`, photosKeyboard);
+  const text = `Фото додано: <b>${count}/10</b>${count < 4 ? `\nПотрібно ще мінімум ${4 - count}.` : "\nМожна переходити далі."}`;
+  if (session.photoStatusMessageId) {
+    try { await editMessage(env, chatId, session.photoStatusMessageId, text, photosKeyboard); } catch {}
+  } else {
+    const status = await sendMessage(env, chatId, text, photosKeyboard) as { message_id: number };
+    session.photoStatusMessageId = status.message_id;
+  }
+  await putSession(env, chatId, session);
 }
 async function chooseCreationMode(env: Env, chatId: number) {
   const session = await getSession(env, chatId);
@@ -485,8 +493,8 @@ async function startWithTemplate(env: Env, chatId: number, id: string) {
   if (!t) return listUserTemplates(env, chatId);
   const limit = await checkDailyLimit(env, chatId); if (!limit.allowed) return sendMessage(env, chatId, "Денний ліміт вичерпано.");
   await removeAllUploadImages(env, chatId);
-  await putSession(env, chatId, { step: "photos", imageKeys: [], ...t.settings, templatePreset: true });
-  await sendMessage(env, chatId, `Шаблон <b>${escapeHtml(t.name)}</b> вибрано. Надішли 4–10 фото.`, photosKeyboard);
+  const status = await sendMessage(env, chatId, `Шаблон <b>${escapeHtml(t.name)}</b> вибрано. Надішли 4–10 фото.`, photosKeyboard) as { message_id: number };
+  await putSession(env, chatId, { step: "photos", imageKeys: [], photoStatusMessageId: status.message_id, ...t.settings, templatePreset: true });
 }
 async function showTemplateEditor(env: Env, chatId: number, id: string) {
   await sendMessage(env, chatId, "Що змінити?", { inline_keyboard: [
@@ -709,7 +717,7 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
     const limit = await checkDailyLimit(env, userId);
     return sendMessage(env, chatId, `Привіт! Я створюю слайд-шоу без watermark. Доступно <b>5 відео на день</b>.\nСьогодні залишилося: <b>${limit.left}</b>.`, createKeyboard);
   }
-  if (message.photo?.length) return acceptPhoto(env, chatId, message.photo);
+  if (message.photo?.length) return acceptPhoto(env, chatId, message.photo, message.media_group_id);
   if (message.text) {
     const session = await getSession(env, chatId); const value = Number(message.text.replace(",", "."));
     if (session?.step === "template_rename" && session.actionTemplateId) { await renameUserTemplate(env, chatId, session.actionTemplateId, message.text); await env.SESSIONS.delete(sessionKey(chatId)); return showTemplateMenu(env, chatId, session.actionTemplateId); }

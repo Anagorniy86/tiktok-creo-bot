@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile, readFile, rm, link, copyFile, stat } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -51,16 +51,26 @@ try {
   }
   const framesNeeded = Math.max(1, Math.ceil(job.duration / job.interval));
   const seq = sequence(paths.length, framesNeeded, job.orderMode);
-  for (let i = 0; i < seq.length; i++) {
-    const framePath = join(dir, `frame-${String(i).padStart(6, "0")}.jpg`);
-    try { await link(paths[seq[i]], framePath); } catch { await copyFile(paths[seq[i]], framePath); }
-  }
   const [width, height] = formats[job.format];
   const effect = job.effect === "zoom" ? `scale=w='trunc(iw*(1+0.06*mod(t\\,1))/2)*2':h='trunc(ih*(1+0.06*mod(t\\,1))/2)*2':eval=frame,crop=${width}:${height}`
     : job.effect === "flash" ? `drawbox=x=0:y=0:w=iw:h=ih:color=white@0.55:t=fill:enable='lt(mod(t\\,${job.interval})\\,0.04)'`
     : job.effect === "glitch" ? "rgbashift=rh=4:bh=-4,noise=alls=7:allf=t+u" : null;
-  const filter = [`scale=${width}:${height}:force_original_aspect_ratio=increase`, `crop=${width}:${height}`, `eq=brightness=${brightness[job.darkness]}:contrast=1.04:saturation=0.95`, vignettes[job.vignette], effect, "fps=30", "format=yuv420p"].filter(Boolean).join(",");
-  await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-framerate", (1 / job.interval).toFixed(6), "-start_number", "0", "-i", join(dir, "frame-%06d.jpg"), "-t", String(job.duration), "-vf", filter, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-movflags", "+faststart", outputPath]);
+  const inputArgs = ["-f", "lavfi", "-i", `color=c=black:s=${width}x${height}:r=30:d=${job.duration}`];
+  for (const path of paths) inputArgs.push("-loop", "1", "-framerate", "30", "-i", path);
+  const graph = [];
+  for (let i = 0; i < paths.length; i++) graph.push(`[${i + 1}:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1[img${i}]`);
+  let current = "0:v";
+  for (let imageIndex = 0; imageIndex < paths.length; imageIndex++) {
+    const ranges = seq.flatMap((value, slot) => value === imageIndex
+      ? [`between(t\\,${(slot * job.interval).toFixed(6)}\\,${Math.min(job.duration, (slot + 1) * job.interval).toFixed(6)})`]
+      : []);
+    const next = `slide${imageIndex}`;
+    graph.push(`[${current}][img${imageIndex}]overlay=shortest=1:enable='${ranges.length ? ranges.join("+") : "0"}'[${next}]`);
+    current = next;
+  }
+  const postFilter = [`eq=brightness=${brightness[job.darkness]}:contrast=1.04:saturation=0.95`, vignettes[job.vignette], effect, "fps=30", "format=yuv420p"].filter(Boolean).join(",");
+  graph.push(`[${current}]${postFilter}[outv]`);
+  await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...inputArgs, "-filter_complex", graph.join(";"), "-map", "[outv]", "-t", String(job.duration), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-movflags", "+faststart", outputPath]);
   const output = await stat(outputPath);
   if (output.size < 10 * 1024) throw new Error(`Rendered video is unexpectedly small: ${output.size} bytes`);
   const duration = Number(await capture("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", outputPath]));

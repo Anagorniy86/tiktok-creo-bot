@@ -10,7 +10,11 @@ const allowed = {
   darkness: ["none", "light", "standard", "strong"], vignette: ["none", "light", "standard", "strong"],
   orderMode: ["original", "shuffle_once", "random_no_repeat"], format: ["vertical", "portrait", "square", "horizontal"],
   effect: ["none", "zoom", "flash", "glitch"],
+  transition: ["cut", "smooth", "motion_blur", "flash"],
+  motion: ["none", "zoom_in", "pan_left", "pan_right"],
 };
+job.transition ||= "cut";
+job.motion ||= "none";
 const formats = { vertical: [1080, 1920], portrait: [1080, 1350], square: [1080, 1080], horizontal: [1920, 1080] };
 const brightness = { none: 0, light: -0.08, standard: -0.16, strong: -0.25 };
 const vignettes = { none: null, light: "vignette=PI/7", standard: "vignette=PI/5", strong: "vignette=PI/3" };
@@ -69,9 +73,15 @@ try {
     graph.push(`[${current}][img${imageIndex}]overlay=shortest=1:enable='${ranges.length ? ranges.join("+") : "0"}'[${next}]`);
     current = next;
   }
-  const postFilter = [`eq=brightness=${brightness[job.darkness]}:contrast=1.04:saturation=0.95`, vignettes[job.vignette], effect, "fps=30", "format=yuv420p"].filter(Boolean).join(",");
+  const motion = job.motion === "zoom_in" ? `scale=w='trunc(iw*(1+0.06*mod(t\,${job.interval})/${job.interval})/2)*2':h='trunc(ih*(1+0.06*mod(t\,${job.interval})/${job.interval})/2)*2':eval=frame,crop=${width}:${height}`
+    : job.motion === "pan_left" ? `scale=${Math.ceil(width * 1.08 / 2) * 2}:${Math.ceil(height * 1.08 / 2) * 2},crop=${width}:${height}:x='(iw-ow)*mod(t\,${job.interval})/${job.interval}':y='(ih-oh)/2'`
+    : job.motion === "pan_right" ? `scale=${Math.ceil(width * 1.08 / 2) * 2}:${Math.ceil(height * 1.08 / 2) * 2},crop=${width}:${height}:x='(iw-ow)*(1-mod(t\,${job.interval})/${job.interval})':y='(ih-oh)/2'` : null;
+  const transition = job.transition === "smooth" ? "tmix=frames=3:weights='1 2 1'"
+    : job.transition === "motion_blur" ? "tmix=frames=5:weights='1 1 2 1 1'"
+    : job.transition === "flash" ? `drawbox=x=0:y=0:w=iw:h=ih:color=white@0.45:t=fill:enable='lt(mod(t\,${job.interval})\,0.05)'` : null;
+  const postFilter = [motion, transition, `eq=brightness=${brightness[job.darkness]}:contrast=1.04:saturation=0.95`, vignettes[job.vignette], effect, "fps=30", "format=yuv420p"].filter(Boolean).join(",");
   graph.push(`[${current}]${postFilter}[outv]`);
-  await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...inputArgs, "-filter_complex", graph.join(";"), "-map", "[outv]", "-t", String(job.duration), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-movflags", "+faststart", outputPath]);
+  await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...inputArgs, "-filter_complex", graph.join(";"), "-map", "[outv]", "-t", String(job.duration), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-maxrate", "3M", "-bufsize", "6M", "-movflags", "+faststart", outputPath]);
   const output = await stat(outputPath);
   if (output.size < 10 * 1024) throw new Error(`Rendered video is unexpectedly small: ${output.size} bytes`);
   const duration = Number(await capture("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", outputPath]));

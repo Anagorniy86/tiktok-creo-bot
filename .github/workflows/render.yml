@@ -11,6 +11,10 @@ on:
       worker_url:
         required: true
         type: string
+      priority:
+        required: false
+        default: "false"
+        type: string
 permissions:
   contents: read
 concurrency:

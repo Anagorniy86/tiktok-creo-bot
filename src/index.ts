@@ -9,12 +9,14 @@ interface Env {
   WORKER_BASE_URL: string;
 }
 
-type Step = "photos" | "template" | "duration" | "speed" | "darkness" | "vignette" | "order" | "effect" | "format" | "confirm" | "template_name" | "template_rename" | "template_copy" | "promo_input" | "feedback_input" | "admin_input" | "rendering";
+type Step = "photos" | "template" | "duration" | "speed" | "darkness" | "vignette" | "order" | "transition" | "motion" | "effect" | "format" | "confirm" | "template_name" | "template_rename" | "template_copy" | "promo_input" | "feedback_input" | "admin_input" | "rendering";
 type Darkness = "none" | "light" | "standard" | "strong";
 type Vignette = "none" | "light" | "standard" | "strong";
 type OrderMode = "original" | "shuffle_once" | "random_no_repeat";
 type VideoFormat = "vertical" | "portrait" | "square" | "horizontal";
 type Effect = "none" | "zoom" | "flash" | "glitch";
+type Transition = "cut" | "smooth" | "motion_blur" | "flash";
+type Motion = "none" | "zoom_in" | "pan_left" | "pan_right";
 type TemplateName = string;
 
 interface Session {
@@ -25,6 +27,8 @@ interface Session {
   darkness?: Darkness;
   vignette?: Vignette;
   orderMode?: OrderMode;
+  transition?: Transition;
+  motion?: Motion;
   format?: VideoFormat;
   effect?: Effect;
   templateName?: TemplateName;
@@ -43,12 +47,15 @@ interface RenderJob {
   darkness: Darkness;
   vignette: Vignette;
   orderMode: OrderMode;
+  transition: Transition;
+  motion: Motion;
   format: VideoFormat;
   effect: Effect;
   templateName: TemplateName;
   statusMessageId: number;
   dailyCounterKey?: string;
   queuedAt: number;
+  priority?: boolean;
 }
 interface TgUser { id: number; username?: string; first_name?: string; last_name?: string }
 interface TelegramUpdate {
@@ -71,7 +78,7 @@ interface TelegramUpdate {
 interface StoredUser extends TgUser { lastSeen: string; blocked?: boolean; referrerId?: number; referralQualified?: boolean }
 interface SavedSettings {
   duration: number; interval: number; darkness: Darkness; vignette: Vignette;
-  orderMode: OrderMode; format: VideoFormat; effect: Effect; templateName: TemplateName;
+  orderMode: OrderMode; transition: Transition; motion: Motion; format: VideoFormat; effect: Effect; templateName: TemplateName;
 }
 interface UserTemplate { id: string; ownerId: number; name: string; settings: SavedSettings; createdAt: string }
 interface LimitBoost { amount: number; expiresAt: number; source: string }
@@ -206,6 +213,16 @@ const orderKeyboard = { inline_keyboard: [
   [{ text: "Як завантажено", callback_data: "order:original" }],
   [{ text: "Перемішати один раз", callback_data: "order:shuffle_once" }],
   [{ text: "Випадково без повтору підряд", callback_data: "order:random_no_repeat" }],  [{ text: "⬅️ Назад", callback_data: "back" }],
+] };
+const transitionKeyboard = { inline_keyboard: [
+  [{ text: "⚡ Різка зміна", callback_data: "transition:cut" }, { text: "🌫 Плавна", callback_data: "transition:smooth" }],
+  [{ text: "💨 Motion blur", callback_data: "transition:motion_blur" }, { text: "✨ Спалах", callback_data: "transition:flash" }],
+  [{ text: "⬅️ Назад", callback_data: "back" }],
+] };
+const motionKeyboard = { inline_keyboard: [
+  [{ text: "Без руху", callback_data: "motion:none" }, { text: "🔍 Наближення", callback_data: "motion:zoom_in" }],
+  [{ text: "⬅️ Рух вліво", callback_data: "motion:pan_left" }, { text: "➡️ Рух вправо", callback_data: "motion:pan_right" }],
+  [{ text: "⬅️ Назад", callback_data: "back" }],
 ] };
 const effectKeyboard = { inline_keyboard: [
   [{ text: "Без додаткового ефекту", callback_data: "effect:none" }],
@@ -367,7 +384,8 @@ async function chooseCreationMode(env: Env, chatId: number) {
   session.imageKeys = await resolveImageKeys(env, chatId, session);
   const minPhotos = session.batchCount ? session.batchCount * 4 : 4;
   if (session.imageKeys.length < minPhotos) return sendMessage(env, chatId, `Знайдено <b>${session.imageKeys.length}</b> фото. Потрібно щонайменше <b>${minPhotos}</b>.`, photosKeyboard);
-  if (session.templatePreset && session.duration && session.interval && session.darkness && session.vignette && session.orderMode && session.format && session.effect && session.templateName) {
+  if (session.templatePreset) { session.transition ||= "cut"; session.motion ||= "none"; }
+  if (session.templatePreset && session.duration && session.interval && session.darkness && session.vignette && session.orderMode && session.transition && session.motion && session.format && session.effect && session.templateName) {
     session.step = "confirm"; await putSession(env, chatId, session); return showConfirmation(env, chatId, session);
   }
   session.step = "template"; await putSession(env, chatId, session);
@@ -397,13 +415,25 @@ async function setVignette(env: Env, chatId: number, value: Vignette) {
 }
 async function setOrder(env: Env, chatId: number, value: OrderMode) {
   const session = await getSession(env, chatId); if (!session || session.step !== "order") return;
-  session.orderMode = value; session.step = "effect"; await putSession(env, chatId, session);
+  session.orderMode = value; session.step = "transition"; await putSession(env, chatId, session);
+  await sendMessage(env, chatId, "Обери перехід між фотографіями:", transitionKeyboard);
+}
+async function setTransition(env: Env, chatId: number, value: Transition) {
+  const session = await getSession(env, chatId); if (!session || session.step !== "transition") return;
+  session.transition = value; session.step = "motion"; await putSession(env, chatId, session);
+  await sendMessage(env, chatId, "Обери рух фотографій:", motionKeyboard);
+}
+async function setMotion(env: Env, chatId: number, value: Motion) {
+  const session = await getSession(env, chatId); if (!session || session.step !== "motion") return;
+  session.motion = value; session.step = "effect"; await putSession(env, chatId, session);
   await sendMessage(env, chatId, "Обери додатковий ефект:", effectKeyboard);
 }
 const labels = {
   darkness: { none: "без затемнення", light: "слабке", standard: "стандартне", strong: "сильне" },
   vignette: { none: "без віньєтки", light: "легка", standard: "стандартна", strong: "сильна" },
   order: { original: "як завантажено", shuffle_once: "перемішано", random_no_repeat: "випадково без повтору" },
+  transition: { cut: "різка", smooth: "плавна", motion_blur: "motion blur", flash: "спалах" },
+  motion: { none: "без руху", zoom_in: "наближення", pan_left: "рух вліво", pan_right: "рух вправо" },
   format: { vertical: "9:16", portrait: "4:5", square: "1:1", horizontal: "16:9" },
   effect: { none: "без ефекту", zoom: "Zoom", flash: "Flash", glitch: "Glitch" },
 } as const;
@@ -416,7 +446,7 @@ async function chooseUserTemplate(env: Env, chatId: number, id: string) {
   const session = await getSession(env, chatId); if (!session || session.step !== "template") return;
   const template = await env.SESSIONS.get<UserTemplate>(`user-template:${chatId}:${id}`, "json");
   if (!template || template.ownerId !== chatId) return sendMessage(env, chatId, "Шаблон не знайдено.", await userTemplateKeyboard(env, chatId));
-  Object.assign(session, template.settings, { templateName: template.name, step: "confirm" });
+  Object.assign(session, { transition: "cut", motion: "none" }, template.settings, { templateName: template.name, step: "confirm" });
   await putSession(env, chatId, session); await showConfirmation(env, chatId, session);
 }
 async function setEffect(env: Env, chatId: number, effect: Effect) {
@@ -429,8 +459,8 @@ async function setFormat(env: Env, chatId: number, format: VideoFormat) {
   session.format = format; session.step = "confirm"; await putSession(env, chatId, session); await showConfirmation(env, chatId, session);
 }
 async function showConfirmation(env: Env, chatId: number, session: Session) {
-  if (!session.duration || !session.interval || !session.darkness || !session.vignette || !session.orderMode || !session.format || !session.templateName) return;
-  await sendMessage(env, chatId, `<b>Перевір налаштування</b>\n\n${session.batchCount ? `Кількість відео: ${session.batchCount}\n` : ""}Шаблон: ${escapeHtml(session.templateName)}\nТривалість: ${session.duration} сек\nШвидкість: ${session.interval} сек\nЗатемнення: ${labels.darkness[session.darkness]}\nВіньєтка: ${labels.vignette[session.vignette]}\nПорядок: ${labels.order[session.orderMode]}\nФормат: ${labels.format[session.format]}\nWatermark: немає`, confirmKeyboard);
+  if (!session.duration || !session.interval || !session.darkness || !session.vignette || !session.orderMode || !session.transition || !session.motion || !session.format || !session.templateName) return;
+  await sendMessage(env, chatId, `<b>Перевір налаштування</b>\n\n${session.batchCount ? `Кількість відео: ${session.batchCount}\n` : ""}Шаблон: ${escapeHtml(session.templateName)}\nТривалість: ${session.duration} сек\nШвидкість: ${session.interval} сек\nЗатемнення: ${labels.darkness[session.darkness]}\nВіньєтка: ${labels.vignette[session.vignette]}\nПорядок: ${labels.order[session.orderMode]}\nПерехід: ${labels.transition[session.transition]}\nРух: ${labels.motion[session.motion]}\nФормат: ${labels.format[session.format]}\nWatermark: немає`, confirmKeyboard);
 }
 function shuffled<T>(values: T[]) {
   const out = [...values];
@@ -445,7 +475,7 @@ function splitBatchImages(keys: string[], count: number) {
 }
 async function startRender(env: Env, chatId: number) {
   const session = await getSession(env, chatId);
-  if (!session || session.step !== "confirm" || !session.duration || !session.interval || !session.darkness || !session.vignette || !session.orderMode || !session.format || !session.effect || !session.templateName) return;
+  if (!session || session.step !== "confirm" || !session.duration || !session.interval || !session.darkness || !session.vignette || !session.orderMode || !session.transition || !session.motion || !session.format || !session.effect || !session.templateName) return;
   session.imageKeys = await resolveImageKeys(env, chatId, session);
   const batchCount = session.batchCount || 1;
   const minPhotos = session.batchCount ? batchCount * 4 : 4;
@@ -455,13 +485,17 @@ async function startRender(env: Env, chatId: number) {
   if (await env.SESSIONS.get(`active-job:${chatId}`)) return sendMessage(env, chatId, "У тебе вже є активна генерація.");
   const groups = session.batchCount ? splitBatchImages(session.imageKeys, batchCount) : [session.imageKeys.slice(0, 10)];
   const pending = Number((await env.SESSIONS.get("queue:pending")) || 0) + groups.length;
+  const priority = Boolean(limit.premiumUntil);
+  const [completedCount, totalRenderMs] = await Promise.all([metric(env, "completed"), metric(env, "render_ms")]);
+  const averageSeconds = completedCount ? Math.max(30, totalRenderMs / completedCount / 1000) : 90;
+  const etaMinutes = Math.max(1, Math.ceil((priority ? averageSeconds : averageSeconds * Math.max(1, pending)) / 60));
   session.step = "rendering"; await putSession(env, chatId, session); await consumeDailyLimit(env, chatId, groups.length);
   const counterKey = limit.premiumUntil ? undefined : dailyKey(chatId);
   const jobs: Array<{ job: RenderJob; token: string }> = [];
   for (let i = 0; i < groups.length; i++) {
     const jobId = crypto.randomUUID();
-    const status = await sendMessage(env, chatId, groups.length > 1 ? `⚙️ <b>Працюю… ${i + 1}/${groups.length}</b>` : "⚙️ <b>Працюю…</b>") as { message_id: number };
-    const job: RenderJob = { jobId, chatId, imageKeys: groups[i], duration: session.duration, interval: session.interval, darkness: session.darkness, vignette: session.vignette, orderMode: session.orderMode, format: session.format, effect: session.effect, templateName: session.templateName, statusMessageId: status.message_id, dailyCounterKey: counterKey, queuedAt: Date.now() };
+    const status = await sendMessage(env, chatId, groups.length > 1 ? `⚙️ <b>Працюю… ${i + 1}/${groups.length}</b>\nПриблизно ${etaMinutes} хв.` : `⚙️ <b>Працюю…</b>\nПриблизно ${etaMinutes} хв.`) as { message_id: number };
+    const job: RenderJob = { jobId, chatId, imageKeys: groups[i], duration: session.duration, interval: session.interval, darkness: session.darkness, vignette: session.vignette, orderMode: session.orderMode, transition: session.transition, motion: session.motion, format: session.format, effect: session.effect, templateName: session.templateName, statusMessageId: status.message_id, dailyCounterKey: counterKey, queuedAt: Date.now(), priority };
     jobs.push({ job, token: crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "") });
   }
   await Promise.all([
@@ -472,8 +506,13 @@ async function startRender(env: Env, chatId: number) {
     env.SESSIONS.put(`active-job:${chatId}`, jobs[0].job.jobId, { expirationTtl: 3600 }),
     env.SESSIONS.put("queue:pending", String(pending)),
   ]);
-  const dispatched = await Promise.allSettled(jobs.map(({ job, token }) => dispatchGitHubRender(env, job.jobId, token)));
-  for (let i = 0; i < dispatched.length; i++) if (dispatched[i].status === "rejected") await failRender(env, jobs[i].job, `Не вдалося запустити GitHub Actions: ${String((dispatched[i] as PromiseRejectedResult).reason)}`);
+  if (priority) {
+    const dispatched = await Promise.allSettled(jobs.map(({ job, token }) => dispatchGitHubRender(env, job.jobId, token, true)));
+    for (let i = 0; i < dispatched.length; i++) if (dispatched[i].status === "rejected") await failRender(env, jobs[i].job, `Не вдалося запустити GitHub Actions: ${String((dispatched[i] as PromiseRejectedResult).reason)}`);
+  } else {
+    const queue = ((await env.SESSIONS.get("render:free-queue", "json")) as string[] | null) || [];
+    await env.SESSIONS.put("render:free-queue", JSON.stringify([...queue, ...jobs.map(({ job }) => job.jobId)]));
+  }
   await Promise.all([incMetric(env, "total_jobs", groups.length), incDailyMetric(env, "queued", groups.length), incMetric(env, `format:${session.format}`, groups.length), incMetric(env, `template:${session.templateName}`, groups.length), incMetric(env, `darkness:${session.darkness}`, groups.length), incMetric(env, `vignette:${session.vignette}`, groups.length), incMetric(env, `order:${session.orderMode}`, groups.length)]);
   if (pending >= QUEUE_ALERT_THRESHOLD) await alertAdmins(env, `Черга досягла ${pending} завдань.`);
 }
@@ -484,10 +523,10 @@ async function askUserTemplateName(env: Env, chatId: number) {
 }
 async function saveUserTemplate(env: Env, chatId: number, name: string) {
   const session = await getSession(env, chatId);
-  if (!session || session.step !== "template_name" || !session.duration || !session.interval || !session.darkness || !session.vignette || !session.orderMode || !session.format || !session.effect) return;
+  if (!session || session.step !== "template_name" || !session.duration || !session.interval || !session.darkness || !session.vignette || !session.orderMode || !session.transition || !session.motion || !session.format || !session.effect) return;
   const cleanName = name.trim().slice(0, 40); if (!cleanName) return sendMessage(env, chatId, "Назва не може бути порожньою.");
   const id = crypto.randomUUID().slice(0, 8); const indexKey = `user-templates:${chatId}:index`;
-  const settings: SavedSettings = { duration: session.duration, interval: session.interval, darkness: session.darkness, vignette: session.vignette, orderMode: session.orderMode, format: session.format, effect: session.effect, templateName: cleanName };
+  const settings: SavedSettings = { duration: session.duration, interval: session.interval, darkness: session.darkness, vignette: session.vignette, orderMode: session.orderMode, transition: session.transition, motion: session.motion, format: session.format, effect: session.effect, templateName: cleanName };
   const template: UserTemplate = { id, ownerId: chatId, name: cleanName, settings, createdAt: new Date().toISOString() };
   const ids = ((await env.SESSIONS.get(indexKey, "json")) as string[] | null) || [];
   if (ids.length >= 20) return sendMessage(env, chatId, "Можна зберегти максимум 20 шаблонів. Видали непотрібний через «Мої шаблони».");
@@ -538,7 +577,7 @@ async function setTemplateProperty(env: Env, chatId: number, id: string, propert
   if (!t) return sendMessage(env, chatId, "Шаблон не знайдено.");
   const allowed: Record<string, string[]> = {
     darkness: ["none","light","standard","strong"], vignette: ["none","light","standard","strong"],
-    orderMode: ["original","shuffle_once","random_no_repeat"], effect: ["none","zoom","flash","glitch"],
+    orderMode: ["original","shuffle_once","random_no_repeat"], transition: ["cut","smooth","motion_blur","flash"], motion: ["none","zoom_in","pan_left","pan_right"], effect: ["none","zoom","flash","glitch"],
     format: ["vertical","portrait","square","horizontal"],
   };
   if (property === "duration") t.settings.duration = Math.min(60, Math.max(1, Number(raw)));
@@ -565,7 +604,7 @@ async function startWithTemplate(env: Env, chatId: number, id: string) {
   if (!t) return listUserTemplates(env, chatId);
   const limit = await checkDailyLimit(env, chatId); if (!limit.allowed) return sendMessage(env, chatId, "Денний ліміт вичерпано.");
   await removeAllUploadImages(env, chatId);
-  await putSession(env, chatId, { step: "photos", imageKeys: [], ...t.settings, templatePreset: true });
+  await putSession(env, chatId, { step: "photos", imageKeys: [], ...t.settings, transition: t.settings.transition || "cut", motion: t.settings.motion || "none", templatePreset: true });
   await sendMessage(env, chatId, `Шаблон <b>${escapeHtml(t.name)}</b> вибрано. Надішли 4–10 фото.`, photosKeyboard);
 }
 async function showTemplateEditor(env: Env, chatId: number, id: string) {
@@ -573,6 +612,7 @@ async function showTemplateEditor(env: Env, chatId: number, id: string) {
     [{ text: "⏱ Тривалість", callback_data: `tplprop:${id}:duration` }, { text: "⚡ Швидкість", callback_data: `tplprop:${id}:interval` }],
     [{ text: "🌑 Затемнення", callback_data: `tplprop:${id}:darkness` }, { text: "⭕ Віньєтка", callback_data: `tplprop:${id}:vignette` }],
     [{ text: "🔀 Порядок", callback_data: `tplprop:${id}:orderMode` }, { text: "✨ Ефект", callback_data: `tplprop:${id}:effect` }],
+    [{ text: "🔄 Перехід", callback_data: `tplprop:${id}:transition` }, { text: "🎥 Рух", callback_data: `tplprop:${id}:motion` }],
     [{ text: "📐 Формат", callback_data: `tplprop:${id}:format` }],
     [{ text: "⬅️ Назад", callback_data: `manage_tpl:${id}` }],
   ]});
@@ -584,6 +624,8 @@ async function showTemplateProperty(env: Env, chatId: number, id: string, prop: 
     darkness: [["Без","none"],["Слабке","light"],["Стандарт","standard"],["Сильне","strong"]],
     vignette: [["Без","none"],["Легка","light"],["Стандарт","standard"],["Сильна","strong"]],
     orderMode: [["Як завантажено","original"],["Перемішати","shuffle_once"],["Випадково","random_no_repeat"]],
+    transition: [["Різка","cut"],["Плавна","smooth"],["Motion blur","motion_blur"],["Спалах","flash"]],
+    motion: [["Без руху","none"],["Наближення","zoom_in"],["Вліво","pan_left"],["Вправо","pan_right"]],
     effect: [["Без","none"],["Zoom","zoom"],["Flash","flash"],["Glitch","glitch"]],
     format: [["9:16","vertical"],["4:5","portrait"],["1:1","square"],["16:9","horizontal"]],
   };
@@ -713,7 +755,9 @@ async function goBack(env: Env, chatId: number) {
   if (s.step === "darkness") { s.step = "speed"; await putSession(env, chatId, s); return sendMessage(env, chatId, "Обери швидкість:", speedKeyboard); }
   if (s.step === "vignette") { s.step = "darkness"; await putSession(env, chatId, s); return sendMessage(env, chatId, "Обери затемнення:", darknessKeyboard); }
   if (s.step === "order") { s.step = "vignette"; await putSession(env, chatId, s); return sendMessage(env, chatId, "Обери віньєтку:", vignetteKeyboard); }
-  if (s.step === "effect") { s.step = "order"; await putSession(env, chatId, s); return sendMessage(env, chatId, "Обери порядок:", orderKeyboard); }
+  if (s.step === "transition") { s.step = "order"; await putSession(env, chatId, s); return sendMessage(env, chatId, "Обери порядок:", orderKeyboard); }
+  if (s.step === "motion") { s.step = "transition"; await putSession(env, chatId, s); return sendMessage(env, chatId, "Обери перехід:", transitionKeyboard); }
+  if (s.step === "effect") { s.step = "motion"; await putSession(env, chatId, s); return sendMessage(env, chatId, "Обери рух:", motionKeyboard); }
   if (s.step === "format" || s.step === "confirm") { s.step = "effect"; await putSession(env, chatId, s); return sendMessage(env, chatId, "Обери ефект:", effectKeyboard); }
   if (s.step === "template_name") { s.step = "confirm"; await putSession(env, chatId, s); return showConfirmation(env, chatId, s); }
 }
@@ -870,6 +914,8 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
     if (data.startsWith("darkness:")) return setDarkness(env, chatId, data.split(":")[1] as Darkness);
     if (data.startsWith("vignette:")) return setVignette(env, chatId, data.split(":")[1] as Vignette);
     if (data.startsWith("order:")) return setOrder(env, chatId, data.split(":")[1] as OrderMode);
+    if (data.startsWith("transition:")) return setTransition(env, chatId, data.split(":")[1] as Transition);
+    if (data.startsWith("motion:")) return setMotion(env, chatId, data.split(":")[1] as Motion);
     if (data.startsWith("effect:")) return setEffect(env, chatId, data.split(":")[1] as Effect);
     if (data.startsWith("format:")) return setFormat(env, chatId, data.split(":")[1] as VideoFormat);
     if (data === "render") return startRender(env, chatId);
@@ -913,7 +959,7 @@ async function sendVideo(env: Env, chatId: number, video: ArrayBuffer, duration:
   if (!result.ok) throw new Error(result.description || "Telegram sendVideo failed");
 }
 interface StoredRenderJob { job: RenderJob; token: string }
-async function dispatchGitHubRender(env: Env, jobId: string, jobToken: string) {
+async function dispatchGitHubRender(env: Env, jobId: string, jobToken: string, priority = false) {
   const response = await fetch(`https://api.github.com/repos/${env.GITHUB_REPOSITORY}/actions/workflows/render.yml/dispatches`, {
     method: "POST",
     headers: {
@@ -923,7 +969,7 @@ async function dispatchGitHubRender(env: Env, jobId: string, jobToken: string) {
       "user-agent": "tiktok-creo-bot",
       "content-type": "application/json",
     },
-    body: JSON.stringify({ ref: "main", inputs: { job_id: jobId, job_token: jobToken, worker_url: env.WORKER_BASE_URL } }),
+    body: JSON.stringify({ ref: "main", inputs: { job_id: jobId, job_token: jobToken, worker_url: env.WORKER_BASE_URL, priority: String(priority) } }),
   });
   if (!response.ok) throw new Error(`GitHub ${response.status}: ${(await response.text()).slice(0, 500)}`);
 }
@@ -986,6 +1032,18 @@ async function completeRender(env: Env, stored: StoredRenderJob, request: Reques
   return json({ ok: true });
 }
 
+async function processFreeRenderQueue(env: Env) {
+  const queue = ((await env.SESSIONS.get("render:free-queue", "json")) as string[] | null) || [];
+  if (!queue.length) return;
+  const selected = queue.slice(0, 2);
+  await env.SESSIONS.put("render:free-queue", JSON.stringify(queue.slice(selected.length)));
+  for (const jobId of selected) {
+    const stored = await env.SESSIONS.get<StoredRenderJob>(`render-job:${jobId}`, "json");
+    if (!stored) continue;
+    try { await dispatchGitHubRender(env, jobId, stored.token, false); }
+    catch (error) { await failRender(env, stored.job, `Не вдалося запустити безкоштовну чергу: ${String(error)}`); }
+  }
+}
 async function cleanupStorage(env: Env) {
   const now = Date.now(); let cursor: string | undefined; let totalBytes = 0; let deleted = 0;
   do {
@@ -1041,6 +1099,8 @@ export default {
     return new Response("TikTok Creo Bot is running", { status: 200 });
   },
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
-    await cleanupStorage(env);
+    await processFreeRenderQueue(env);
+    const lastCleanup = Date.parse((await env.SESSIONS.get("storage:last_cleanup")) || "0");
+    if (!Number.isFinite(lastCleanup) || Date.now() - lastCleanup > 60 * 60 * 1000) await cleanupStorage(env);
   },
 } satisfies ExportedHandler<Env, RenderJob>;

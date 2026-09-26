@@ -10,7 +10,7 @@
   "kv_namespaces": [
     {
       "binding": "SESSIONS",
-      "id": "PASTE_KV_NAMESPACE_ID_HERE"
+      "id": "0aab37f1e9a3431d82395880e451d17b"
     }
   ],
   "r2_buckets": [

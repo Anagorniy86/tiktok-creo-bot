@@ -98,7 +98,7 @@ const PREMIUM_STARS = 100;
 const PREMIUM_DAYS = 30;
 const BOT_USERNAME = "avto_creo_bot";
 const RATE_LIMIT_PER_MINUTE = 60;
-const OUTPUT_TTL_MS = 72 * 60 * 60 * 1000;
+const OUTPUT_TTL_MS = 60 * 60 * 1000;
 const UPLOAD_TTL_MS = 6 * 60 * 60 * 1000;
 const QUEUE_ALERT_THRESHOLD = 20;
 const STORAGE_ALERT_BYTES = 5 * 1024 * 1024 * 1024;
@@ -156,6 +156,7 @@ async function incDailyMetric(env: Env, name: string, delta = 1) {
 async function recordError(env: Env, where: string, error: unknown) {
   const item = { at: new Date().toISOString(), where, message: error instanceof Error ? error.message : String(error) };
   const list = ((await env.SESSIONS.get("admin:errors", "json")) as typeof item[] | null) || [];
+  if (list[0]?.where === item.where && list[0]?.message === item.message && Date.now() - Date.parse(list[0].at) < 10 * 60 * 1000) return;
   list.unshift(item);
   await env.SESSIONS.put("admin:errors", JSON.stringify(list.slice(0, 20)));
 }
@@ -251,7 +252,7 @@ const confirmKeyboard = { inline_keyboard: [
 ] };
 const adminKeyboard = { inline_keyboard: [
   [{ text: "📊 Статистика", callback_data: "admin:stats" }, { text: "👥 Користувачі", callback_data: "admin:users" }],
-  [{ text: "⚠️ Помилки", callback_data: "admin:errors" }],
+  [{ text: "⚠️ Помилки", callback_data: "admin:errors" }, { text: "🧹 Очистити", callback_data: "admin:clear_errors" }],
   [{ text: "🔧 Технічні роботи", callback_data: "admin:maintenance" }],
   [{ text: "🎚 Встановити ліміт", callback_data: "admin:limit" }, { text: "♻️ Скинути ліміт", callback_data: "admin:reset_limit" }],
   [{ text: "🚫 Заблокувати", callback_data: "admin:block" }, { text: "✅ Розблокувати", callback_data: "admin:unblock" }],
@@ -364,13 +365,14 @@ async function acceptPhoto(env: Env, chatId: number, photos: Array<{ file_id: st
   const key = `uploads/${chatId}/${crypto.randomUUID()}.${ext}`;
   await env.MEDIA.put(key, data, { httpMetadata: { contentType: `image/${ext === "jpg" ? "jpeg" : ext}` } });
   if (mediaGroupId) {
-    const markerKey = `album-markers/${chatId}/${mediaGroupId}`;
-    const marker = crypto.randomUUID();
-    await env.MEDIA.put(markerKey, marker);
-    await new Promise((resolve) => setTimeout(resolve, 1200));
-    const currentMarker = await env.MEDIA.get(markerKey);
-    if (!currentMarker || await currentMarker.text() !== marker) return;
-    await env.MEDIA.delete(markerKey);
+    const markerPrefix = `album-markers/${chatId}/${mediaGroupId}/`;
+    const markerKey = `${markerPrefix}${crypto.randomUUID()}`;
+    await env.MEDIA.put(markerKey, String(Date.now()));
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const markers = await env.MEDIA.list({ prefix: markerPrefix, limit: 100 });
+    const latest = [...markers.objects].sort((a, b) => b.uploaded.getTime() - a.uploaded.getTime() || b.key.localeCompare(a.key))[0];
+    if (!latest || latest.key !== markerKey) return;
+    if (markers.objects.length) await env.MEDIA.delete(markers.objects.map((object) => object.key));
   }
   const keys = (await resolveImageKeys(env, chatId, session)).slice(0, maxPhotos);
   session.imageKeys = keys;
@@ -866,6 +868,7 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
       if (data === "admin:stats") return adminStats(env, chatId);
       if (data === "admin:users") return adminUsers(env, chatId);
       if (data === "admin:errors") return adminErrors(env, chatId);
+      if (data === "admin:clear_errors") { await env.SESSIONS.delete("admin:errors"); return sendMessage(env, chatId, "✅ Журнал помилок очищено.", adminKeyboard); }
       if (data === "admin:maintenance") {
         const enabled = await env.SESSIONS.get("admin:maintenance") !== "1";
         await env.SESSIONS.put("admin:maintenance", enabled ? "1" : "0");
@@ -1101,6 +1104,6 @@ export default {
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     await processFreeRenderQueue(env);
     const lastCleanup = Date.parse((await env.SESSIONS.get("storage:last_cleanup")) || "0");
-    if (!Number.isFinite(lastCleanup) || Date.now() - lastCleanup > 60 * 60 * 1000) await cleanupStorage(env);
+    if (!Number.isFinite(lastCleanup) || Date.now() - lastCleanup > 15 * 60 * 1000) await cleanupStorage(env);
   },
 } satisfies ExportedHandler<Env, RenderJob>;

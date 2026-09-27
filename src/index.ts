@@ -105,6 +105,198 @@ const STORAGE_ALERT_BYTES = 5 * 1024 * 1024 * 1024;
 const apiUrl = (env: Env, method: string) => `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`;
 const escapeHtml = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const isAdmin = (env: Env, userId: number) => (env.ADMIN_TELEGRAM_IDS || "").split(",").map((x) => x.trim()).includes(String(userId));
+type Language = "ru" | "uk" | "en";
+const languageKey = (userId: number) => `language:${userId}`;
+async function getLanguage(env: Env, userId: number): Promise<Language> {
+  const saved = await env.SESSIONS.get(languageKey(userId));
+  return saved === "uk" || saved === "en" || saved === "ru" ? saved : "ru";
+}
+
+const RU_REPLACEMENTS: Array<[string, string]> = [
+  ["Створити декілька відео", "Создать несколько видео"],
+  ["Створити одне відео", "Создать одно видео"],
+  ["Реферальна програма", "Реферальная программа"],
+  ["Видалити мої дані", "Удалить мои данные"],
+  ["Зберегти як мій шаблон", "Сохранить как мой шаблон"],
+  ["Повідомити про проблему", "Сообщить о проблеме"],
+  ["Випадково без повтору підряд", "Случайно без повтора подряд"],
+  ["Перемішати один раз", "Перемешать один раз"],
+  ["Обери один зі своїх приватних шаблонів або налаштуй відео вручну:", "Выбери один из своих приватных шаблонов или настрой видео вручную:"],
+  ["Надішли одним або кількома альбомами", "Отправь одним или несколькими альбомами"],
+  ["З них буде створено", "Из них будет создано"],
+  ["різних відео", "разных видео"],
+  ["Сьогодні залишилося відео", "Сегодня осталось видео"],
+  ["Сьогодні залишилося", "Сегодня осталось"],
+  ["Залишилося сьогодні", "Осталось сегодня"],
+  ["Безкоштовно доступно", "Бесплатно доступно"],
+  ["Денний ліміт вичерпано", "Дневной лимит исчерпан"],
+  ["Потрібно щонайменше", "Нужно как минимум"],
+  ["доступних генерацій", "доступных генераций"],
+  ["Зараз залишилося", "Сейчас осталось"],
+  ["Недостатньо генерацій", "Недостаточно генераций"],
+  ["У тебе вже є активна генерація", "У тебя уже есть активная генерация"],
+  ["Фото не знайдено", "Фото не найдены"],
+  ["Знайдено", "Найдено"],
+  ["Потрібно ще мінімум", "Нужно ещё минимум"],
+  ["Можна переходити далі", "Можно переходить дальше"],
+  ["Фото прийнято", "Фото принято"],
+  ["Уже є максимум", "Уже загружен максимум"],
+  ["Це фото завелике", "Это фото слишком большое"],
+  ["Спочатку натисни", "Сначала нажми"],
+  ["Створити слайд-шоу", "Создать слайд-шоу"],
+  ["Коли завершиш — натисни", "Когда закончишь — нажми"],
+  ["Надішли", "Отправь"],
+  ["Обери швидкість зміни фото", "Выбери скорость смены фото"],
+  ["Обери силу затемнення", "Выбери силу затемнения"],
+  ["Обери силу віньєтки", "Выбери силу виньетки"],
+  ["Обери порядок фотографій", "Выбери порядок фотографий"],
+  ["Обери перехід між фотографіями", "Выбери переход между фотографиями"],
+  ["Обери рух фотографій", "Выбери движение фотографий"],
+  ["Обери додатковий ефект", "Выбери дополнительный эффект"],
+  ["Обери тривалість", "Выбери длительность"],
+  ["Обери формат відео", "Выбери формат видео"],
+  ["Обери шаблон", "Выбери шаблон"],
+  ["Обери нове значення", "Выбери новое значение"],
+  ["Обери віньєтку", "Выбери виньетку"],
+  ["Обери затемнення", "Выбери затемнение"],
+  ["Обери швидкість", "Выбери скорость"],
+  ["Обери перехід", "Выбери переход"],
+  ["Обери порядок", "Выбери порядок"],
+  ["Обери ефект", "Выбери эффект"],
+  ["Обери рух", "Выбери движение"],
+  ["Обери", "Выбери"],
+  ["Перевір налаштування", "Проверь настройки"],
+  ["Кількість відео", "Количество видео"],
+  ["Тривалість", "Длительность"],
+  ["Швидкість", "Скорость"],
+  ["Затемнення", "Затемнение"],
+  ["Віньєтка", "Виньетка"],
+  ["Порядок", "Порядок"],
+  ["Перехід", "Переход"],
+  ["Рух", "Движение"],
+  ["без затемнення", "без затемнения"],
+  ["слабке", "слабое"],
+  ["стандартне", "стандартное"],
+  ["сильне", "сильное"],
+  ["без віньєтки", "без виньетки"],
+  ["легка", "лёгкая"],
+  ["стандартна", "стандартная"],
+  ["сильна", "сильная"],
+  ["як завантажено", "как загружено"],
+  ["перемішано", "перемешано"],
+  ["випадково без повтору", "случайно без повтора"],
+  ["різка", "резкая"],
+  ["плавна", "плавная"],
+  ["спалах", "вспышка"],
+  ["без руху", "без движения"],
+  ["наближення", "приближение"],
+  ["рух вліво", "движение влево"],
+  ["рух вправо", "движение вправо"],
+  ["без ефекту", "без эффекта"],
+  ["Без затемнення", "Без затемнения"],
+  ["Без віньєтки", "Без виньетки"],
+  ["Без руху", "Без движения"],
+  ["Без додаткового ефекту", "Без дополнительного эффекта"],
+  ["Слабке", "Слабое"], ["Стандартне", "Стандартное"], ["Сильне", "Сильное"],
+  ["Легка", "Лёгкая"], ["Стандартна", "Стандартная"], ["Сильна", "Сильная"],
+  ["Як завантажено", "Как загружено"],
+  ["Різка зміна", "Резкая смена"], ["Плавна", "Плавная"], ["Спалах", "Вспышка"],
+  ["Наближення", "Приближение"], ["Рух вліво", "Движение влево"], ["Рух вправо", "Движение вправо"],
+  ["Головне меню", "Главное меню"],
+  ["Мої шаблони", "Мои шаблоны"], ["Мій профіль", "Мой профиль"], ["Допомога", "Помощь"],
+  ["Почати заново", "Начать заново"], ["Створити відео", "Создать видео"],
+  ["Створити вручну", "Настроить вручную"], ["Створити нове відео", "Создать новое видео"],
+  ["Скасувати", "Отмена"], ["Скасовано", "Отменено"], ["Назад", "Назад"], ["Далі", "Далее"],
+  ["Так, видалити", "Да, удалить"], ["Точно видалити шаблон", "Точно удалить шаблон"],
+  ["Видалити", "Удалить"], ["Копіювати", "Копировать"], ["Перейменувати", "Переименовать"],
+  ["Редагувати", "Редактировать"], ["Використати", "Использовать"], ["До шаблонів", "К шаблонам"],
+  ["Мої приватні шаблони", "Мои приватные шаблоны"], ["У тебе ще немає шаблонів", "У тебя ещё нет шаблонов"],
+  ["Шаблон не знайдено", "Шаблон не найден"], ["Власний", "Свой"],
+  ["Працюю", "Работаю"], ["Надсилаю", "Отправляю"], ["Готово", "Готово"],
+  ["Можеш створити наступне відео", "Можешь создать следующее видео"],
+  ["Не вдалося створити відео. Ліміт повернуто", "Не удалось создать видео. Лимит возвращён"],
+  ["Спробуй ще раз трохи пізніше", "Попробуй ещё раз немного позже"],
+  ["Створення скасовано. Ліміт повернуто", "Создание отменено. Лимит возвращён"],
+  ["Скасування прийнято. Файли буде видалено", "Отмена принята. Файлы будут удалены"],
+  ["Це завдання вже завершене", "Это задание уже завершено"],
+  ["Дякую за оцінку", "Спасибо за оценку"],
+  ["Дякую. Можеш також описати проблему кнопкою нижче", "Спасибо. Можешь также описать проблему кнопкой ниже"],
+  ["Скористайся кнопкою нижче", "Используй кнопку ниже"],
+  ["Привіт! Я створюю", "Привет! Я создаю"], ["без watermark", "без водяного знака"],
+  ["відео на день", "видео в день"], ["безліміт", "безлимит"],
+  ["Активних бонусів", "Активных бонусов"], ["Твоє посилання", "Твоя ссылка"],
+  ["Запроси друга", "Пригласи друга"], ["Коли він створить перше відео", "Когда он создаст первое видео"],
+  ["ти отримаєш", "ты получишь"], ["щодня на 30 днів", "ежедневно на 30 дней"],
+  ["Приватних шаблонів", "Приватных шаблонов"], ["Купити безліміт", "Купить безлимит"],
+  ["Одне відео", "Одно видео"], ["Декілька відео", "Несколько видео"],
+  ["завантаж", "загрузи"], ["Безкоштовно", "Бесплатно"],
+  ["Усі функції доступні кнопками", "Все функции доступны кнопками"],
+  ["Забагато дій. Спробуй через хвилину", "Слишком много действий. Попробуй через минуту"],
+  ["Бот тимчасово оновлюється. Спробуй пізніше", "Бот временно обновляется. Попробуй позже"],
+  ["Мова", "Язык"],
+];
+
+const EN_REPLACEMENTS: Array<[string, string]> = [
+  ["Створити декілька відео", "Create multiple videos"], ["Створити одне відео", "Create one video"],
+  ["Реферальна програма", "Referral program"], ["Видалити мої дані", "Delete my data"],
+  ["Зберегти як мій шаблон", "Save as my template"], ["Повідомити про проблему", "Report a problem"],
+  ["Випадково без повтору підряд", "Random without consecutive repeats"], ["Перемішати один раз", "Shuffle once"],
+  ["Сьогодні залишилося відео", "Videos left today"], ["Сьогодні залишилося", "Left today"],
+  ["Залишилося сьогодні", "Left today"], ["Безкоштовно доступно", "Available for free"],
+  ["Денний ліміт вичерпано", "Daily limit reached"], ["Потрібно щонайменше", "At least"],
+  ["Недостатньо генерацій", "Not enough generations"], ["У тебе вже є активна генерація", "You already have an active generation"],
+  ["Фото не знайдено", "Photos not found"], ["Фото прийнято", "Photos accepted"],
+  ["Потрібно ще мінімум", "Still needed"], ["Можна переходити далі", "You can continue"],
+  ["Спочатку натисни", "First press"], ["Коли завершиш — натисни", "When finished, press"], ["Надішли", "Send"],
+  ["Обери швидкість зміни фото", "Choose the photo change speed"], ["Обери силу затемнення", "Choose darkening strength"],
+  ["Обери силу віньєтки", "Choose vignette strength"], ["Обери порядок фотографій", "Choose photo order"],
+  ["Обери перехід між фотографіями", "Choose a transition"], ["Обери рух фотографій", "Choose photo motion"],
+  ["Обери додатковий ефект", "Choose an additional effect"], ["Обери тривалість", "Choose duration"],
+  ["Обери формат відео", "Choose video format"], ["Обери нове значення", "Choose a new value"],
+  ["Обери шаблон", "Choose a template"], ["Обери", "Choose"],
+  ["Перевір налаштування", "Check settings"], ["Кількість відео", "Number of videos"],
+  ["Тривалість", "Duration"], ["Швидкість", "Speed"], ["Затемнення", "Darkening"],
+  ["Віньєтка", "Vignette"], ["Порядок", "Order"], ["Перехід", "Transition"], ["Рух", "Motion"],
+  ["Без затемнення", "No darkening"], ["Без віньєтки", "No vignette"], ["Без руху", "No motion"],
+  ["Без додаткового ефекту", "No additional effect"], ["Слабке", "Light"], ["Стандартне", "Standard"],
+  ["Сильне", "Strong"], ["Легка", "Light"], ["Стандартна", "Standard"], ["Сильна", "Strong"],
+  ["Як завантажено", "As uploaded"], ["Різка зміна", "Cut"], ["Плавна", "Smooth"], ["Спалах", "Flash"],
+  ["Наближення", "Zoom in"], ["Рух вліво", "Move left"], ["Рух вправо", "Move right"],
+  ["Головне меню", "Main menu"], ["Мої шаблони", "My templates"], ["Мій профіль", "My profile"],
+  ["Допомога", "Help"], ["Почати заново", "Start over"], ["Створити відео", "Create video"],
+  ["Створити вручну", "Set up manually"], ["Створити нове відео", "Create a new video"],
+  ["Скасувати", "Cancel"], ["Скасовано", "Cancelled"], ["Назад", "Back"], ["Далі", "Next"],
+  ["Так, видалити", "Yes, delete"], ["Видалити", "Delete"], ["Копіювати", "Copy"],
+  ["Перейменувати", "Rename"], ["Редагувати", "Edit"], ["Використати", "Use"],
+  ["Працюю", "Working"], ["Надсилаю", "Sending"], ["Готово", "Done"],
+  ["Можеш створити наступне відео", "You can create the next video"],
+  ["Спробуй ще раз трохи пізніше", "Please try again later"], ["Скористайся кнопкою нижче", "Use the button below"],
+  ["Привіт! Я створюю", "Hi! I create"], ["відео на день", "videos per day"], ["безліміт", "unlimited"],
+  ["Активних бонусів", "Active bonuses"], ["Твоє посилання", "Your link"],
+  ["Запроси друга", "Invite a friend"], ["Коли він створить перше відео", "When they create their first video"],
+  ["ти отримаєш", "you will receive"], ["щодня на 30 днів", "daily for 30 days"],
+  ["Приватних шаблонів", "Private templates"], ["Купити безліміт", "Buy unlimited"],
+  ["Одне відео", "One video"], ["Декілька відео", "Multiple videos"], ["завантаж", "upload"],
+  ["Безкоштовно", "Free"], ["Усі функції доступні кнопками", "All features are available through buttons"],
+  ["Забагато дій. Спробуй через хвилину", "Too many actions. Try again in a minute"],
+  ["Бот тимчасово оновлюється. Спробуй пізніше", "The bot is being updated. Try again later"],
+  ["Мова", "Language"], ["сек", "sec"],
+];
+
+function localizeText(text: string, language: Language) {
+  if (language === "uk") return text;
+  const replacements = language === "ru" ? RU_REPLACEMENTS : EN_REPLACEMENTS;
+  return replacements.reduce((result, [from, to]) => result.replaceAll(from, to), text);
+}
+function localizeMarkup(markup: unknown, language: Language): unknown {
+  if (!markup || typeof markup !== "object") return markup;
+  if (Array.isArray(markup)) return markup.map((item) => localizeMarkup(item, language));
+  const localized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(markup as Record<string, unknown>)) {
+    localized[key] = key === "text" && typeof value === "string" ? localizeText(value, language) : localizeMarkup(value, language);
+  }
+  return localized;
+}
 
 async function telegram(env: Env, method: string, payload: Record<string, unknown>) {
   const response = await fetch(apiUrl(env, method), {
@@ -117,15 +309,17 @@ async function telegram(env: Env, method: string, payload: Record<string, unknow
   return body.result;
 }
 async function sendMessage(env: Env, chatId: number, text: string, replyMarkup?: unknown) {
+  const language = await getLanguage(env, chatId);
   return telegram(env, "sendMessage", {
-    chat_id: chatId, text, parse_mode: "HTML",
-    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    chat_id: chatId, text: localizeText(text, language), parse_mode: "HTML",
+    ...(replyMarkup ? { reply_markup: localizeMarkup(replyMarkup, language) } : {}),
   });
 }
 async function editMessage(env: Env, chatId: number, messageId: number, text: string, replyMarkup?: unknown) {
+  const language = await getLanguage(env, chatId);
   return telegram(env, "editMessageText", {
-    chat_id: chatId, message_id: messageId, text, parse_mode: "HTML",
-    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    chat_id: chatId, message_id: messageId, text: localizeText(text, language), parse_mode: "HTML",
+    ...(replyMarkup ? { reply_markup: localizeMarkup(replyMarkup, language) } : {}),
   });
 }
 async function alertAdmins(env: Env, text: string) {
@@ -183,7 +377,14 @@ const createKeyboard = { inline_keyboard: [
   [{ text: "🎁 Реферальна програма", callback_data: "referral" }, { text: "🎟 Промокод", callback_data: "promo" }],
   [{ text: "📁 Мої шаблони", callback_data: "my_templates" }],
   [{ text: "👤 Мій профіль", callback_data: "profile" }, { text: "ℹ️ Допомога", callback_data: "help" }],
+  [{ text: "🌐 Мова", callback_data: "language_menu" }],
   [{ text: "🗑 Видалити мої дані", callback_data: "delete_my_data" }],
+] };
+const languageKeyboard = { inline_keyboard: [
+  [{ text: "Русский", callback_data: "language:ru" }],
+  [{ text: "Українська", callback_data: "language:uk" }],
+  [{ text: "English", callback_data: "language:en" }],
+  [{ text: "⬅️ Головне меню", callback_data: "main_menu" }],
 ] };
 const batchCountKeyboard = { inline_keyboard: [
   [3, 4].map((n) => ({ text: `${n} відео`, callback_data: `batch_count:${n}` })),
@@ -486,7 +687,7 @@ async function startRender(env: Env, chatId: number) {
   if (!limit.premiumUntil && limit.left < batchCount) return sendMessage(env, chatId, `⛔ Недостатньо генерацій. Потрібно <b>${batchCount}</b>, залишилося <b>${limit.left}</b>.`);
   if (await env.SESSIONS.get(`active-job:${chatId}`)) return sendMessage(env, chatId, "У тебе вже є активна генерація.");
   const groups = session.batchCount ? splitBatchImages(session.imageKeys, batchCount) : [session.imageKeys.slice(0, 10)];
-  const pending = Number((await env.SESSIONS.get("queue:pending")) || 0) + groups.length;
+  const pending = await actualPendingJobs(env) + groups.length;
   const priority = Boolean(limit.premiumUntil);
   const [completedCount, totalRenderMs] = await Promise.all([metric(env, "completed"), metric(env, "render_ms")]);
   const averageSeconds = completedCount ? Math.max(30, totalRenderMs / completedCount / 1000) : 90;
@@ -770,7 +971,7 @@ async function adminStats(env: Env, chatId: number) {
   const formats = await Promise.all(["vertical", "portrait", "square", "horizontal"].map((n) => metric(env, `format:${n}`)));
   const [todayCompleted, todayFailed, totalRenderMs, outputBytes, pending] = await Promise.all([
     env.SESSIONS.get(`daily-metric:${kyivDate()}:completed`), env.SESSIONS.get(`daily-metric:${kyivDate()}:failed`),
-    metric(env, "render_ms"), metric(env, "output_bytes"), env.SESSIONS.get("queue:pending"),
+    metric(env, "render_ms"), metric(env, "output_bytes"), actualPendingJobs(env),
   ]);
   const averageSeconds = completed ? (totalRenderMs / completed / 1000).toFixed(1) : "0";
   await sendMessage(env, chatId,
@@ -882,6 +1083,14 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
       if (data === "admin:premium") return promptAdmin(env, chatId, "premium");
       if (data === "admin:promo") return promptAdmin(env, chatId, "promo");
     }
+    if (data === "language_menu") return sendMessage(env, chatId, "<b>Оберіть мову / Выберите язык / Choose language</b>", languageKeyboard);
+    if (data.startsWith("language:")) {
+      const language = data.split(":")[1] as Language;
+      if (!["ru", "uk", "en"].includes(language)) return;
+      await env.SESSIONS.put(languageKey(chatId), language);
+      const saved = language === "ru" ? "✅ Язык изменён на русский." : language === "uk" ? "✅ Мову змінено на українську." : "✅ Language changed to English.";
+      return sendMessage(env, chatId, saved, createKeyboard);
+    }
     if (data === "main_menu") return sendMessage(env, chatId, "<b>Головне меню</b>", createKeyboard);
     if (data === "batch_create") return sendMessage(env, chatId, "Скільки різних відео створити?", batchCountKeyboard);
     if (data.startsWith("batch_count:")) return resetBatchSession(env, chatId, Number(data.split(":")[1]));
@@ -953,9 +1162,10 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
 }
 
 async function sendVideo(env: Env, chatId: number, video: ArrayBuffer, duration: number, jobId: string) {
+  const language = await getLanguage(env, chatId);
   const form = new FormData(); form.append("chat_id", String(chatId)); form.append("supports_streaming", "true");
-  form.append("caption", `✅ Готово: ${duration} сек`);
-  form.append("reply_markup", JSON.stringify({ inline_keyboard: [[{ text: "👍", callback_data: `rate:up:${jobId}` }, { text: "👎", callback_data: `rate:down:${jobId}` }], [{ text: "⚠️ Повідомити про проблему", callback_data: `report:${jobId}` }]] }));
+  form.append("caption", localizeText(`✅ Готово: ${duration} сек`, language));
+  form.append("reply_markup", JSON.stringify(localizeMarkup({ inline_keyboard: [[{ text: "👍", callback_data: `rate:up:${jobId}` }, { text: "👎", callback_data: `rate:down:${jobId}` }], [{ text: "⚠️ Повідомити про проблему", callback_data: `report:${jobId}` }]] }, language)));
   form.append("video", new Blob([video], { type: "video/mp4" }), "tiktok-creo.mp4");
   const response = await fetch(apiUrl(env, "sendVideo"), { method: "POST", body: form });
   const result = (await response.json()) as { ok: boolean; description?: string };
@@ -985,6 +1195,22 @@ async function loadRenderJob(env: Env, jobId: string, token: string | null) {
 async function decrementPending(env: Env) {
   const pending = Math.max(0, Number((await env.SESSIONS.get("queue:pending")) || 1) - 1);
   await env.SESSIONS.put("queue:pending", String(pending));
+}
+async function actualPendingJobs(env: Env) {
+  let cursor: string | undefined;
+  let pending = 0;
+  do {
+    const page = await env.SESSIONS.list({ prefix: "job:", cursor, limit: 1000 });
+    const states = await Promise.all(page.keys.map((key) => env.SESSIONS.get<{status:string}>(key.name, "json")));
+    const active = page.keys
+      .map((key, index) => ({ jobId: key.name.slice(4), state: states[index] }))
+      .filter(({ state }) => state && ["queued", "rendering", "uploading"].includes(state.status));
+    const stored = await Promise.all(active.map(({ jobId }) => env.SESSIONS.get<StoredRenderJob>(`render-job:${jobId}`, "json")));
+    pending += stored.filter((item) => item && Date.now() - item.job.queuedAt < 2 * 60 * 60 * 1000).length;
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  await env.SESSIONS.put("queue:pending", String(pending));
+  return pending;
 }
 async function failRender(env: Env, job: RenderJob, detail: string) {
   const state = await env.SESSIONS.get<{status:string}>(`job:${job.jobId}`, "json");
@@ -1038,8 +1264,10 @@ async function completeRender(env: Env, stored: StoredRenderJob, request: Reques
 async function processFreeRenderQueue(env: Env) {
   const queue = ((await env.SESSIONS.get("render:free-queue", "json")) as string[] | null) || [];
   if (!queue.length) return;
-  const selected = queue.slice(0, 2);
-  await env.SESSIONS.put("render:free-queue", JSON.stringify(queue.slice(selected.length)));
+  const valid: string[] = [];
+  for (const jobId of queue) if (await env.SESSIONS.get(`render-job:${jobId}`)) valid.push(jobId);
+  const selected = valid.slice(0, 2);
+  await env.SESSIONS.put("render:free-queue", JSON.stringify(valid.slice(selected.length)));
   for (const jobId of selected) {
     const stored = await env.SESSIONS.get<StoredRenderJob>(`render-job:${jobId}`, "json");
     if (!stored) continue;

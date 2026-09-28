@@ -96,6 +96,7 @@ const dailyKey = (userId: number) => `daily:${userId}:${kyivDate()}`;
 const DAILY_LIMIT = 10;
 const PREMIUM_STARS = 100;
 const PREMIUM_DAYS = 30;
+const SUPPORTER_DAILY_BONUS = 2;
 const BOT_USERNAME = "avto_creo_bot";
 const RATE_LIMIT_PER_MINUTE = 60;
 const OUTPUT_TTL_MS = 60 * 60 * 1000;
@@ -107,9 +108,17 @@ const escapeHtml = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "
 const isAdmin = (env: Env, userId: number) => (env.ADMIN_TELEGRAM_IDS || "").split(",").map((x) => x.trim()).includes(String(userId));
 type Language = "ru" | "uk" | "en";
 const languageKey = (userId: number) => `language:${userId}`;
+const languageCache = new Map<number, { value: Language; expiresAt: number }>();
+const rateCache = new Map<string, number>();
+const userSeenCache = new Map<number, number>();
+const blockedCache = new Map<number, { value: boolean; expiresAt: number }>();
 async function getLanguage(env: Env, userId: number): Promise<Language> {
+  const cached = languageCache.get(userId);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
   const saved = await env.SESSIONS.get(languageKey(userId));
-  return saved === "uk" || saved === "en" || saved === "ru" ? saved : "ru";
+  const value = saved === "uk" || saved === "en" || saved === "ru" ? saved : "ru";
+  languageCache.set(userId, { value, expiresAt: Date.now() + 30 * 60 * 1000 });
+  return value;
 }
 
 const RU_REPLACEMENTS: Array<[string, string]> = [
@@ -228,6 +237,10 @@ const RU_REPLACEMENTS: Array<[string, string]> = [
   ["Запроси друга", "Пригласи друга"], ["Коли він створить перше відео", "Когда он создаст первое видео"],
   ["ти отримаєш", "ты получишь"], ["щодня на 30 днів", "ежедневно на 30 дней"],
   ["Приватних шаблонів", "Приватных шаблонов"], ["Купити безліміт", "Купить безлимит"],
+  ["Подякувати автору", "Поддержать автора"], ["Подяка автору", "Спасибо автору"], ["Підтримка автора", "Поддержка автора"],
+  ["Пріоритетна черга", "Приоритетная очередь"], ["до 12 відео на день", "до 12 видео в день"],
+  ["Активовано статус підтримки", "Активирован статус поддержки"], ["пріоритетна черга", "приоритетная очередь"],
+  ["Дякую за підтримку", "Спасибо за поддержку"], ["доступно +2 відео на день", "доступно +2 видео в день"],
   ["Одне відео", "Одно видео"], ["Декілька відео", "Несколько видео"],
   ["завантаж", "загрузи"], ["Безкоштовно", "Бесплатно"],
   ["Усі функції доступні кнопками", "Все функции доступны кнопками"],
@@ -276,6 +289,10 @@ const EN_REPLACEMENTS: Array<[string, string]> = [
   ["Запроси друга", "Invite a friend"], ["Коли він створить перше відео", "When they create their first video"],
   ["ти отримаєш", "you will receive"], ["щодня на 30 днів", "daily for 30 days"],
   ["Приватних шаблонів", "Private templates"], ["Купити безліміт", "Buy unlimited"],
+  ["Подякувати автору", "Support the creator"], ["Подяка автору", "Thank the creator"], ["Підтримка автора", "Creator support"],
+  ["Пріоритетна черга", "Priority queue"], ["до 12 відео на день", "up to 12 videos per day"],
+  ["Активовано статус підтримки", "Supporter status activated"], ["пріоритетна черга", "priority queue"],
+  ["Дякую за підтримку", "Thank you for your support"], ["доступно +2 відео на день", "+2 videos per day are available"],
   ["Одне відео", "One video"], ["Декілька відео", "Multiple videos"], ["завантаж", "upload"],
   ["Безкоштовно", "Free"], ["Усі функції доступні кнопками", "All features are available through buttons"],
   ["Забагато дій. Спробуй через хвилину", "Too many actions. Try again in a minute"],
@@ -331,9 +348,16 @@ async function rateAllowed(env: Env, userId: number) {
   if (isAdmin(env, userId)) return true;
   const minute = Math.floor(Date.now() / 60000);
   const key = `rate:${userId}:${minute}`;
-  const used = Number((await env.SESSIONS.get(key)) || 0);
+  const used = rateCache.get(key) || 0;
   if (used >= RATE_LIMIT_PER_MINUTE) return false;
-  await env.SESSIONS.put(key, String(used + 1), { expirationTtl: 120 });
+  rateCache.set(key, used + 1);
+  if (rateCache.size > 5000) {
+    const oldestMinute = minute - 2;
+    for (const cachedKey of rateCache.keys()) {
+      const cachedMinute = Number(cachedKey.split(":").pop());
+      if (cachedMinute < oldestMinute) rateCache.delete(cachedKey);
+    }
+  }
   return true;
 }
 async function incMetric(env: Env, name: string, delta = 1) {
@@ -356,24 +380,34 @@ async function recordError(env: Env, where: string, error: unknown) {
 }
 async function registerUser(env: Env, user?: TgUser) {
   if (!user) return;
+  const now = Date.now();
+  if (now - (userSeenCache.get(user.id) || 0) < 6 * 60 * 60 * 1000) return;
   const key = userKey(user.id);
   const existing = await env.SESSIONS.get<StoredUser>(key, "json");
-  if (existing && Date.now() - new Date(existing.lastSeen).getTime() < 10 * 60 * 1000) return;
+  userSeenCache.set(user.id, now);
+  blockedCache.set(user.id, { value: Boolean(existing?.blocked), expiresAt: now + 30 * 60 * 1000 });
+  if (existing && now - new Date(existing.lastSeen).getTime() < 6 * 60 * 60 * 1000) return;
   const saved: StoredUser = { ...existing, ...user, lastSeen: new Date().toISOString(), blocked: existing?.blocked || false };
   await env.SESSIONS.put(key, JSON.stringify(saved));
-  if (!existing) await incMetric(env, "total_users");
-  const recent = ((await env.SESSIONS.get("admin:recent_users", "json")) as number[] | null) || [];
-  await env.SESSIONS.put("admin:recent_users", JSON.stringify([user.id, ...recent.filter((id) => id !== user.id)].slice(0, 50)));
+  if (!existing) {
+    await incMetric(env, "total_users");
+    const recent = ((await env.SESSIONS.get("admin:recent_users", "json")) as number[] | null) || [];
+    await env.SESSIONS.put("admin:recent_users", JSON.stringify([user.id, ...recent.filter((id) => id !== user.id)].slice(0, 50)));
+  }
 }
 async function isBlocked(env: Env, userId: number) {
+  const cached = blockedCache.get(userId);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
   const user = await env.SESSIONS.get<StoredUser>(userKey(userId), "json");
-  return Boolean(user?.blocked);
+  const value = Boolean(user?.blocked);
+  blockedCache.set(userId, { value, expiresAt: Date.now() + 30 * 60 * 1000 });
+  return value;
 }
 
 const createKeyboard = { inline_keyboard: [
   [{ text: "🎞 Створити одне відео", callback_data: "create" }],
   [{ text: "🎬 Створити декілька відео", callback_data: "batch_create" }],
-  [{ text: "⭐ Безліміт — 100 Stars", callback_data: "buy_premium" }],
+  [{ text: "❤️ Подякувати автору — 100 Stars", callback_data: "buy_premium" }],
   [{ text: "🎁 Реферальна програма", callback_data: "referral" }, { text: "🎟 Промокод", callback_data: "promo" }],
   [{ text: "📁 Мої шаблони", callback_data: "my_templates" }],
   [{ text: "👤 Мій профіль", callback_data: "profile" }, { text: "ℹ️ Допомога", callback_data: "help" }],
@@ -457,7 +491,7 @@ const adminKeyboard = { inline_keyboard: [
   [{ text: "🔧 Технічні роботи", callback_data: "admin:maintenance" }],
   [{ text: "🎚 Встановити ліміт", callback_data: "admin:limit" }, { text: "♻️ Скинути ліміт", callback_data: "admin:reset_limit" }],
   [{ text: "🚫 Заблокувати", callback_data: "admin:block" }, { text: "✅ Розблокувати", callback_data: "admin:unblock" }],
-  [{ text: "⭐ Видати безліміт", callback_data: "admin:premium" }, { text: "🎟 Створити промокод", callback_data: "admin:promo" }],
+  [{ text: "❤️ Видати статус підтримки", callback_data: "admin:premium" }, { text: "🎟 Створити промокод", callback_data: "admin:promo" }],
   [{ text: "📣 Розсилка", callback_data: "admin:broadcast" }],
   [{ text: "⬅️ Головне меню", callback_data: "main_menu" }],
 ] };
@@ -500,13 +534,16 @@ async function activeBoosts(env: Env, userId: number) {
   return active;
 }
 async function checkDailyLimit(env: Env, userId: number) {
-  const used = await dailyUsed(env, userId);
-  const premium = await premiumUntil(env, userId);
-  if (premium > Date.now()) return { allowed: true, used, left: Number.MAX_SAFE_INTEGER, limit: Number.MAX_SAFE_INTEGER, premiumUntil: premium };
-  const custom = await env.SESSIONS.get(`limit:${userId}`);
-  const boost = (await activeBoosts(env, userId)).reduce((sum, item) => sum + item.amount, 0);
-  const limit = (custom === null ? DAILY_LIMIT : Number(custom)) + boost;
-  return { allowed: used < limit, used, left: Math.max(0, limit - used), limit, premiumUntil: 0 };
+  const [used, premium, custom, boosts] = await Promise.all([
+    dailyUsed(env, userId),
+    premiumUntil(env, userId),
+    env.SESSIONS.get(`limit:${userId}`),
+    activeBoosts(env, userId),
+  ]);
+  const supporter = premium > Date.now();
+  const boost = boosts.reduce((sum, item) => sum + item.amount, 0);
+  const limit = (custom === null ? DAILY_LIMIT : Number(custom)) + boost + (supporter ? SUPPORTER_DAILY_BONUS : 0);
+  return { allowed: used < limit, used, left: Math.max(0, limit - used), limit, premiumUntil: supporter ? premium : 0 };
 }
 async function grantPremium(env: Env, userId: number, days = PREMIUM_DAYS) {
   const current = await premiumUntil(env, userId);
@@ -526,11 +563,10 @@ async function refundDailyLimit(env: Env, key?: string) {
   await env.SESSIONS.put(key, String(Math.max(0, used - 1)), { expirationTtl: 172800 });
 }
 async function consumeDailyLimit(env: Env, userId: number, count = 1) {
-  if (await premiumUntil(env, userId) > Date.now()) return;
   const key = dailyKey(userId); const used = await dailyUsed(env, userId);
   await env.SESSIONS.put(key, String(used + count), { expirationTtl: 172800 });
 }
-const leftLabel = (limit: Awaited<ReturnType<typeof checkDailyLimit>>) => limit.premiumUntil ? "безліміт" : String(limit.left);
+const leftLabel = (limit: Awaited<ReturnType<typeof checkDailyLimit>>) => String(limit.left);
 async function resetSession(env: Env, chatId: number) {
   const limit = await checkDailyLimit(env, chatId);
   if (!limit.allowed) return sendMessage(env, chatId, "⛔ Денний ліміт вичерпано. Безкоштовно доступно <b>10 відео на день</b>.");
@@ -542,7 +578,7 @@ async function resetSession(env: Env, chatId: number) {
 async function resetBatchSession(env: Env, chatId: number, batchCount: number) {
   if (![3, 4, 5, 6].includes(batchCount)) return;
   const limit = await checkDailyLimit(env, chatId);
-  if (!limit.premiumUntil && limit.left < batchCount) return sendMessage(env, chatId, `Потрібно щонайменше <b>${batchCount}</b> доступних генерацій. Зараз залишилося: <b>${limit.left}</b>.`);
+  if (limit.left < batchCount) return sendMessage(env, chatId, `Потрібно щонайменше <b>${batchCount}</b> доступних генерацій. Зараз залишилося: <b>${limit.left}</b>.`);
   await removeAllUploadImages(env, chatId);
   await putSession(env, chatId, { step: "photos", imageKeys: [], batchCount });
   await sendMessage(env, chatId, `Надішли одним або кількома альбомами <b>${batchCount * 4}–${batchCount * 5} фото</b>. З них буде створено <b>${batchCount} різних відео</b> по 4–5 фото.`, photosKeyboard);
@@ -684,7 +720,7 @@ async function startRender(env: Env, chatId: number) {
   const minPhotos = session.batchCount ? batchCount * 4 : 4;
   if (session.imageKeys.length < minPhotos) return sendMessage(env, chatId, `Фото не знайдено. Потрібно щонайменше ${minPhotos}.`, createKeyboard);
   const limit = await checkDailyLimit(env, chatId);
-  if (!limit.premiumUntil && limit.left < batchCount) return sendMessage(env, chatId, `⛔ Недостатньо генерацій. Потрібно <b>${batchCount}</b>, залишилося <b>${limit.left}</b>.`);
+  if (limit.left < batchCount) return sendMessage(env, chatId, `⛔ Недостатньо генерацій. Потрібно <b>${batchCount}</b>, залишилося <b>${limit.left}</b>.`);
   if (await env.SESSIONS.get(`active-job:${chatId}`)) return sendMessage(env, chatId, "У тебе вже є активна генерація.");
   const groups = session.batchCount ? splitBatchImages(session.imageKeys, batchCount) : [session.imageKeys.slice(0, 10)];
   const pending = await actualPendingJobs(env) + groups.length;
@@ -693,7 +729,7 @@ async function startRender(env: Env, chatId: number) {
   const averageSeconds = completedCount ? Math.max(30, totalRenderMs / completedCount / 1000) : 90;
   const etaMinutes = Math.max(1, Math.ceil((priority ? averageSeconds : averageSeconds * Math.max(1, pending)) / 60));
   session.step = "rendering"; await putSession(env, chatId, session); await consumeDailyLimit(env, chatId, groups.length);
-  const counterKey = limit.premiumUntil ? undefined : dailyKey(chatId);
+  const counterKey = dailyKey(chatId);
   const jobs: Array<{ job: RenderJob; token: string }> = [];
   for (let i = 0; i < groups.length; i++) {
     const jobId = crypto.randomUUID();
@@ -716,7 +752,7 @@ async function startRender(env: Env, chatId: number) {
     const queue = ((await env.SESSIONS.get("render:free-queue", "json")) as string[] | null) || [];
     await env.SESSIONS.put("render:free-queue", JSON.stringify([...queue, ...jobs.map(({ job }) => job.jobId)]));
   }
-  await Promise.all([incMetric(env, "total_jobs", groups.length), incDailyMetric(env, "queued", groups.length), incMetric(env, `format:${session.format}`, groups.length), incMetric(env, `template:${session.templateName}`, groups.length), incMetric(env, `darkness:${session.darkness}`, groups.length), incMetric(env, `vignette:${session.vignette}`, groups.length), incMetric(env, `order:${session.orderMode}`, groups.length)]);
+  await Promise.all([incMetric(env, "total_jobs", groups.length), incMetric(env, `format:${session.format}`, groups.length)]);
   if (pending >= QUEUE_ALERT_THRESHOLD) await alertAdmins(env, `Черга досягла ${pending} завдань.`);
 }
 async function askUserTemplateName(env: Env, chatId: number) {
@@ -866,13 +902,31 @@ async function showReferral(env: Env, chatId: number) {
   await sendMessage(env, chatId, `<b>🎁 Реферальна програма</b>\n\nЗапроси друга. Коли він створить перше відео, ти отримаєш <b>+2 відео щодня на 30 днів</b>.\n\nТвоє посилання:\n<code>${link}</code>\n\nАктивних бонусів: <b>${boosts.length}</b>.`, { inline_keyboard: [[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]] });
 }
 async function buyPremium(env: Env, chatId: number) {
+  const language = await getLanguage(env, chatId);
+  const copy = {
+    ru: {
+      title: "Поддержать автора",
+      description: "Разовая благодарность автору. На 30 дней: +2 видео в день и приоритетная очередь.",
+      label: "Спасибо автору",
+    },
+    uk: {
+      title: "Подякувати автору",
+      description: "Разова подяка автору. На 30 днів: +2 відео на день і пріоритетна черга.",
+      label: "Подяка автору",
+    },
+    en: {
+      title: "Support the creator",
+      description: "A one-time thank you. For 30 days: +2 videos per day and priority queue.",
+      label: "Thank the creator",
+    },
+  }[language];
   await telegram(env, "sendInvoice", {
     chat_id: chatId,
-    title: "Безліміт на 30 днів",
-    description: "Необмежене створення відео протягом 30 днів.",
-    payload: `premium30:${chatId}`,
+    title: copy.title,
+    description: copy.description,
+    payload: `support30:${chatId}`,
     currency: "XTR",
-    prices: [{ label: "Безліміт на 30 днів", amount: PREMIUM_STARS }],
+    prices: [{ label: copy.label, amount: PREMIUM_STARS }],
   });
 }
 async function askPromo(env: Env, chatId: number) {
@@ -890,7 +944,7 @@ async function redeemPromo(env: Env, userId: number, rawCode: string) {
   if (promo.type === "premium") await grantPremium(env, userId, promo.value);
   else await addLimitBoost(env, userId, promo.value, 30, `promo:${code}`);
   await Promise.all([env.SESSIONS.put(key, JSON.stringify(promo)), env.SESSIONS.delete(sessionKey(userId)), incMetric(env, "promo_redemptions")]);
-  await sendMessage(env, userId, promo.type === "premium" ? `✅ Активовано безліміт на <b>${promo.value} днів</b>.` : `✅ Денний ліміт збільшено на <b>+${promo.value}</b> протягом 30 днів.`, createKeyboard);
+  await sendMessage(env, userId, promo.type === "premium" ? `✅ Активовано статус підтримки на <b>${promo.value} днів</b>: +2 відео на день і пріоритетна черга.` : `✅ Денний ліміт збільшено на <b>+${promo.value}</b> протягом 30 днів.`, createKeyboard);
 }
 async function askFeedback(env: Env, chatId: number, jobId: string) {
   await putSession(env, chatId, { step: "feedback_input", imageKeys: [], feedbackJobId: jobId });
@@ -905,13 +959,13 @@ async function saveFeedback(env: Env, chatId: number, session: Session, text: st
 async function showProfile(env: Env, chatId: number) {
   const limit = await checkDailyLimit(env, chatId);
   const ids = ((await env.SESSIONS.get(`user-templates:${chatId}:index`, "json")) as string[] | null) || [];
-  const status = limit.premiumUntil ? `⭐ Безліміт до ${new Date(limit.premiumUntil).toLocaleDateString("uk-UA", { timeZone: "Europe/Kyiv" })}` : `Залишилося сьогодні: <b>${limit.left}/${limit.limit}</b>`;
+  const status = `${limit.premiumUntil ? `❤️ Підтримка автора до ${new Date(limit.premiumUntil).toLocaleDateString("uk-UA", { timeZone: "Europe/Kyiv" })}\n` : ""}Залишилося сьогодні: <b>${limit.left}/${limit.limit}</b>`;
   await sendMessage(env, chatId, `<b>👤 Мій профіль</b>\n\nTelegram ID: <code>${chatId}</code>\n${status}\nПриватних шаблонів: <b>${ids.length}/20</b>\nWatermark: <b>немає</b>`, {
-    inline_keyboard: [[{ text: "⭐ Купити безліміт", callback_data: "buy_premium" }],[{ text: "🎁 Реферальна програма", callback_data: "referral" }, { text: "🎟 Промокод", callback_data: "promo" }],[{ text: "📁 Мої шаблони", callback_data: "my_templates" }],[{ text: "🗑 Видалити мої дані", callback_data: "delete_my_data" }],[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]],
+    inline_keyboard: [[{ text: "❤️ Подякувати автору", callback_data: "buy_premium" }],[{ text: "🎁 Реферальна програма", callback_data: "referral" }, { text: "🎟 Промокод", callback_data: "promo" }],[{ text: "📁 Мої шаблони", callback_data: "my_templates" }],[{ text: "🗑 Видалити мої дані", callback_data: "delete_my_data" }],[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]],
   });
 }
 async function showHelp(env: Env, chatId: number) {
-  await sendMessage(env, chatId, "<b>ℹ️ Допомога</b>\n\n• Одне відео: завантаж 4–10 фото.\n• Декілька відео: обери 3–6 та завантаж 4–5 фото на кожне.\n• Безкоштовно: 10 відео на день.\n• Безліміт на 30 днів: 100 Stars.\n\nУсі функції доступні кнопками.", { inline_keyboard: [[{ text: "🎞 Створити", callback_data: "create" }, { text: "🎬 Декілька", callback_data: "batch_create" }],[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]] });
+  await sendMessage(env, chatId, "<b>ℹ️ Допомога</b>\n\n• Одне відео: завантаж 4–10 фото.\n• Декілька відео: обери 3–6 та завантаж 4–5 фото на кожне.\n• Безкоштовно: 10 відео на день.\n• Подяка автору — 100 Stars: до 12 відео на день і пріоритетна черга протягом 30 днів.\n\nУсі функції доступні кнопками.", { inline_keyboard: [[{ text: "🎞 Створити", callback_data: "create" }, { text: "🎬 Декілька", callback_data: "batch_create" }],[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]] });
 }
 async function promptAdmin(env: Env, chatId: number, action: Session["adminAction"]) {
   await putSession(env, chatId, { step: "admin_input", imageKeys: [], adminAction: action });
@@ -936,7 +990,7 @@ async function handleAdminInput(env: Env, chatId: number, session: Session, text
   else if (action === "premium") {
     const [idRaw, daysRaw] = text.trim().split(/\s+/); const id = Number(idRaw); const days = Number(daysRaw || 30);
     if (!id || !days) await sendMessage(env, chatId, "Неправильний формат.", adminKeyboard);
-    else { await grantPremium(env, id, days); await sendMessage(env, chatId, `✅ Користувачу <code>${id}</code> видано безліміт на <b>${days} днів</b>.`, adminKeyboard); }
+    else { await grantPremium(env, id, days); await sendMessage(env, chatId, `✅ Користувачу <code>${id}</code> видано статус підтримки на <b>${days} днів</b>.`, adminKeyboard); }
   }
   else if (action === "promo") {
     const [codeRaw, typeRaw, valueRaw, usesRaw] = text.trim().split(/\s+/);
@@ -998,6 +1052,7 @@ async function setBlocked(env: Env, chatId: number, userId: number, blocked: boo
   if (!user) return sendMessage(env, chatId, "Користувача не знайдено.");
   if (user.blocked !== blocked) await incMetric(env, "blocked", blocked ? 1 : -1);
   user.blocked = blocked; await env.SESSIONS.put(userKey(userId), JSON.stringify(user));
+  blockedCache.set(userId, { value: blocked, expiresAt: Date.now() + 30 * 60 * 1000 });
   await sendMessage(env, chatId, blocked ? `🚫 Користувача <code>${userId}</code> заблоковано.` : `✅ Користувача <code>${userId}</code> розблоковано.`);
 }
 async function broadcast(env: Env, chatId: number, text: string) {
@@ -1041,10 +1096,11 @@ async function deleteMyData(env: Env, chatId: number) {
   const ids = ((await env.SESSIONS.get(indexKey, "json")) as string[] | null) || [];
   await Promise.all([
     ...ids.map((id) => env.SESSIONS.delete(`user-template:${chatId}:${id}`)),
-    env.SESSIONS.delete(indexKey), env.SESSIONS.delete(sessionKey(chatId)), env.SESSIONS.delete(userKey(chatId)),
+    env.SESSIONS.delete(indexKey), env.SESSIONS.delete(sessionKey(chatId)), env.SESSIONS.delete(userKey(chatId)), env.SESSIONS.delete(languageKey(chatId)),
     env.SESSIONS.delete(dailyKey(chatId)), env.SESSIONS.delete(`premium:${chatId}`), env.SESSIONS.delete(`limit-boosts:${chatId}`),
     deletePrefix(env, `uploads/${chatId}/`), deletePrefix(env, `outputs/${chatId}/`),
   ]);
+  languageCache.delete(chatId); userSeenCache.delete(chatId); blockedCache.delete(chatId);
   await sendMessage(env, chatId, "✅ Твої файли, шаблони, сесія та профіль видалені.");
 }
 
@@ -1054,8 +1110,11 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
   const user = callback?.from || checkout?.from || update.message?.from;
   await registerUser(env, user);
   if (checkout) {
-    const valid = checkout.currency === "XTR" && checkout.total_amount === PREMIUM_STARS && checkout.invoice_payload === `premium30:${checkout.from.id}`;
-    await telegram(env, "answerPreCheckoutQuery", { pre_checkout_query_id: checkout.id, ok: valid, ...(valid ? {} : { error_message: "Неправильні параметри платежу." }) });
+    const language = await getLanguage(env, checkout.from.id);
+    const validPayload = checkout.invoice_payload === `support30:${checkout.from.id}` || checkout.invoice_payload === `premium30:${checkout.from.id}`;
+    const valid = checkout.currency === "XTR" && checkout.total_amount === PREMIUM_STARS && validPayload;
+    const paymentError = language === "ru" ? "Неверные параметры платежа." : language === "en" ? "Invalid payment parameters." : "Неправильні параметри платежу.";
+    await telegram(env, "answerPreCheckoutQuery", { pre_checkout_query_id: checkout.id, ok: valid, ...(valid ? {} : { error_message: paymentError }) });
     return;
   }
   if (user && await isBlocked(env, user.id) && !isAdmin(env, user.id)) return;
@@ -1088,6 +1147,7 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
       const language = data.split(":")[1] as Language;
       if (!["ru", "uk", "en"].includes(language)) return;
       await env.SESSIONS.put(languageKey(chatId), language);
+      languageCache.set(chatId, { value: language, expiresAt: Date.now() + 30 * 60 * 1000 });
       const saved = language === "ru" ? "✅ Язык изменён на русский." : language === "uk" ? "✅ Мову змінено на українську." : "✅ Language changed to English.";
       return sendMessage(env, chatId, saved, createKeyboard);
     }
@@ -1136,9 +1196,9 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
   }
   const message = update.message; if (!message) return;
   const chatId = message.chat.id; const userId = message.from?.id || chatId;
-  if (message.successful_payment?.invoice_payload === `premium30:${userId}` && message.successful_payment.currency === "XTR" && message.successful_payment.total_amount === PREMIUM_STARS) {
+  if ([`support30:${userId}`, `premium30:${userId}`].includes(message.successful_payment?.invoice_payload || "") && message.successful_payment?.currency === "XTR" && message.successful_payment.total_amount === PREMIUM_STARS) {
     const until = await grantPremium(env, userId, PREMIUM_DAYS); await incMetric(env, "premium_purchases");
-    return sendMessage(env, chatId, `⭐ Безліміт активовано до <b>${new Date(until).toLocaleDateString("uk-UA", { timeZone: "Europe/Kyiv" })}</b>.`, createKeyboard);
+    return sendMessage(env, chatId, `❤️ Дякую за підтримку! До <b>${new Date(until).toLocaleDateString("uk-UA", { timeZone: "Europe/Kyiv" })}</b> доступно +2 відео на день і пріоритетна черга.`, createKeyboard);
   }
   if (message.text && await handleAdminCommand(env, chatId, userId, message.text)) return;
   if (message.text?.startsWith("/start")) {
@@ -1253,8 +1313,7 @@ async function completeRender(env: Env, stored: StoredRenderJob, request: Reques
     env.SESSIONS.delete(`active-job:${job.chatId}`), env.SESSIONS.delete(`render-job:${job.jobId}`),
     env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "done", chatId: job.chatId }), { expirationTtl: 86400 }),
     incMetric(env, "completed"), incMetric(env, "rendered_seconds", job.duration), incMetric(env, "render_ms", renderMs),
-    incMetric(env, "output_bytes", video.byteLength), incDailyMetric(env, "completed"), incDailyMetric(env, "render_ms", renderMs),
-    incDailyMetric(env, "output_bytes", video.byteLength),
+    incMetric(env, "output_bytes", video.byteLength), incDailyMetric(env, "completed"),
   ]);
   await qualifyReferral(env, job.chatId);
   await sendMessage(env, job.chatId, "Можеш створити наступне відео 👇", createKeyboard);

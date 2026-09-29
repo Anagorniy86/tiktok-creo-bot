@@ -54,6 +54,11 @@ try {
     await writeFile(path, Buffer.from(await response.arrayBuffer()));
     return path;
   }));
+  await fetch(`${workerUrl}/github/render/${jobId}/stage`, {
+    method: "POST",
+    headers: { "X-Render-Token": token, "Content-Type": "text/plain" },
+    body: "rendering",
+  }).catch(() => {});
   const framesNeeded = Math.max(1, Math.ceil(job.duration / job.interval));
   const seq = sequence(paths.length, framesNeeded, job.orderMode);
   const [width, height] = formats[job.format];

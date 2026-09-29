@@ -33,10 +33,11 @@ interface Session {
   effect?: Effect;
   templateName?: TemplateName;
   templatePreset?: boolean;
+  quickMode?: boolean;
   batchCount?: number;
   actionTemplateId?: string;
   feedbackJobId?: string;
-  adminAction?: "limit" | "reset_limit" | "block" | "unblock" | "broadcast" | "premium" | "promo";
+  adminAction?: "limit" | "reset_limit" | "block" | "unblock" | "broadcast" | "premium" | "promo" | "user_search";
 }
 interface RenderJob {
   jobId: string;
@@ -56,9 +57,12 @@ interface RenderJob {
   dailyCounterKey?: string;
   queuedAt: number;
   priority?: boolean;
+  retryCount?: number;
 }
+interface QueueMeta { chatId: number; statusMessageId: number; language: Language; lastPosition?: number }
 interface TgUser { id: number; username?: string; first_name?: string; last_name?: string }
 interface TelegramUpdate {
+  update_id?: number;
   message?: {
     chat: { id: number };
     from?: TgUser;
@@ -93,6 +97,7 @@ const userKey = (userId: number) => `user:${userId}`;
 const metricKey = (name: string) => `metric:${name}`;
 const kyivDate = () => new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Kyiv", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
 const dailyKey = (userId: number) => `daily:${userId}:${kyivDate()}`;
+const lastSettingsKey = (userId: number) => `last-settings:${userId}`;
 const DAILY_LIMIT = 10;
 const PREMIUM_STARS = 100;
 const PREMIUM_DAYS = 30;
@@ -102,6 +107,8 @@ const RATE_LIMIT_PER_MINUTE = 60;
 const OUTPUT_TTL_MS = 60 * 60 * 1000;
 const UPLOAD_TTL_MS = 6 * 60 * 60 * 1000;
 const QUEUE_ALERT_THRESHOLD = 20;
+const MAX_CONCURRENT_RENDERS = 2;
+const RENDER_TIMEOUT_MS = 20 * 60 * 1000;
 const STORAGE_ALERT_BYTES = 5 * 1024 * 1024 * 1024;
 const apiUrl = (env: Env, method: string) => `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`;
 const escapeHtml = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -112,6 +119,7 @@ const languageCache = new Map<number, { value: Language; expiresAt: number }>();
 const rateCache = new Map<string, number>();
 const userSeenCache = new Map<number, number>();
 const blockedCache = new Map<number, { value: boolean; expiresAt: number }>();
+const recentUpdateIds = new Map<number, number>();
 async function getLanguage(env: Env, userId: number): Promise<Language> {
   const cached = languageCache.get(userId);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
@@ -241,6 +249,11 @@ const RU_REPLACEMENTS: Array<[string, string]> = [
   ["Пріоритетна черга", "Приоритетная очередь"], ["до 12 відео на день", "до 12 видео в день"],
   ["Активовано статус підтримки", "Активирован статус поддержки"], ["пріоритетна черга", "приоритетная очередь"],
   ["Дякую за підтримку", "Спасибо за поддержку"], ["доступно +2 відео на день", "доступно +2 видео в день"],
+  ["Швидке створення", "Быстрое создание"], ["Очікує в черзі", "Ожидает в очереди"],
+  ["Твоє місце", "Твоё место"], ["Завантажую фото", "Загружаю фото"], ["Створюю відео", "Создаю видео"],
+  ["Запускаю рендер", "Запускаю рендер"],
+  ["Рендер затримався", "Рендер задерживается"], ["працює і не завис", "работает и не завис"],
+  ["Реферальна статистика", "Реферальная статистика"], ["Переходів", "Переходов"], ["Активували бонус", "Активировали бонус"],
   ["Одне відео", "Одно видео"], ["Декілька відео", "Несколько видео"],
   ["завантаж", "загрузи"], ["Безкоштовно", "Бесплатно"],
   ["Усі функції доступні кнопками", "Все функции доступны кнопками"],
@@ -293,6 +306,11 @@ const EN_REPLACEMENTS: Array<[string, string]> = [
   ["Пріоритетна черга", "Priority queue"], ["до 12 відео на день", "up to 12 videos per day"],
   ["Активовано статус підтримки", "Supporter status activated"], ["пріоритетна черга", "priority queue"],
   ["Дякую за підтримку", "Thank you for your support"], ["доступно +2 відео на день", "+2 videos per day are available"],
+  ["Швидке створення", "Quick create"], ["Очікує в черзі", "Waiting in queue"],
+  ["Твоє місце", "Your position"], ["Завантажую фото", "Downloading photos"], ["Створюю відео", "Creating video"],
+  ["Запускаю рендер", "Starting render"],
+  ["Рендер затримався", "The render is delayed"], ["працює і не завис", "is working and has not frozen"],
+  ["Реферальна статистика", "Referral statistics"], ["Переходів", "Visits"], ["Активували бонус", "Activated bonus"],
   ["Одне відео", "One video"], ["Декілька відео", "Multiple videos"], ["завантаж", "upload"],
   ["Безкоштовно", "Free"], ["Усі функції доступні кнопками", "All features are available through buttons"],
   ["Забагато дій. Спробуй через хвилину", "Too many actions. Try again in a minute"],
@@ -406,6 +424,7 @@ async function isBlocked(env: Env, userId: number) {
 
 const createKeyboard = { inline_keyboard: [
   [{ text: "🎞 Створити одне відео", callback_data: "create" }],
+  [{ text: "⚡ Швидке створення", callback_data: "quick_create" }],
   [{ text: "🎬 Створити декілька відео", callback_data: "batch_create" }],
   [{ text: "❤️ Подякувати автору — 100 Stars", callback_data: "buy_premium" }],
   [{ text: "🎁 Реферальна програма", callback_data: "referral" }, { text: "🎟 Промокод", callback_data: "promo" }],
@@ -487,6 +506,8 @@ const confirmKeyboard = { inline_keyboard: [
 ] };
 const adminKeyboard = { inline_keyboard: [
   [{ text: "📊 Статистика", callback_data: "admin:stats" }, { text: "👥 Користувачі", callback_data: "admin:users" }],
+  [{ text: "🔎 Знайти користувача", callback_data: "admin:user_search" }, { text: "🩺 Стан бота", callback_data: "admin:system" }],
+  [{ text: "🔐 Безпека", callback_data: "admin:security" }],
   [{ text: "⚠️ Помилки", callback_data: "admin:errors" }, { text: "🧹 Очистити", callback_data: "admin:clear_errors" }],
   [{ text: "🔧 Технічні роботи", callback_data: "admin:maintenance" }],
   [{ text: "🎚 Встановити ліміт", callback_data: "admin:limit" }, { text: "♻️ Скинути ліміт", callback_data: "admin:reset_limit" }],
@@ -575,6 +596,17 @@ async function resetSession(env: Env, chatId: number) {
   await sendMessage(env, chatId, `Надішли <b>4–10 фото</b>. Коли завершиш — натисни «Далі».
 Сьогодні залишилося відео: <b>${leftLabel(limit)}</b>`, photosKeyboard);
 }
+async function startQuickCreation(env: Env, chatId: number) {
+  const limit = await checkDailyLimit(env, chatId);
+  if (!limit.allowed) return sendMessage(env, chatId, "⛔ Денний ліміт вичерпано.");
+  const settings = await env.SESSIONS.get<SavedSettings>(lastSettingsKey(chatId), "json");
+  if (!settings) return sendMessage(env, chatId, "Спочатку створи хоча б одне відео вручну. Після цього швидкий режим запам’ятає налаштування.", {
+    inline_keyboard: [[{ text: "🎞 Створити перше відео", callback_data: "create" }], [{ text: "⬅️ Головне меню", callback_data: "main_menu" }]],
+  });
+  await removeAllUploadImages(env, chatId);
+  await putSession(env, chatId, { ...settings, step: "photos", imageKeys: [], templatePreset: true, quickMode: true });
+  await sendMessage(env, chatId, `⚡ <b>Швидке створення</b>\n\nНадішли 4–10 фото і натисни «Далі». Бот одразу запустить рендер з останніми налаштуваннями.\nЗалишилося сьогодні: <b>${limit.left}</b>.`, photosKeyboard);
+}
 async function resetBatchSession(env: Env, chatId: number, batchCount: number) {
   if (![3, 4, 5, 6].includes(batchCount)) return;
   const limit = await checkDailyLimit(env, chatId);
@@ -625,7 +657,9 @@ async function chooseCreationMode(env: Env, chatId: number) {
   if (session.imageKeys.length < minPhotos) return sendMessage(env, chatId, `Знайдено <b>${session.imageKeys.length}</b> фото. Потрібно щонайменше <b>${minPhotos}</b>.`, photosKeyboard);
   if (session.templatePreset) { session.transition ||= "cut"; session.motion ||= "none"; }
   if (session.templatePreset && session.duration && session.interval && session.darkness && session.vignette && session.orderMode && session.transition && session.motion && session.format && session.effect && session.templateName) {
-    session.step = "confirm"; await putSession(env, chatId, session); return showConfirmation(env, chatId, session);
+    session.step = "confirm"; await putSession(env, chatId, session);
+    if (session.quickMode) return startRender(env, chatId);
+    return showConfirmation(env, chatId, session);
   }
   session.step = "template"; await putSession(env, chatId, session);
   await sendMessage(env, chatId, "Обери один зі своїх приватних шаблонів або налаштуй відео вручну:", await userTemplateKeyboard(env, chatId));
@@ -712,6 +746,13 @@ function splitBatchImages(keys: string[], count: number) {
   for (let i = count * 4; i < Math.min(pool.length, count * 5); i++) groups[i - count * 4].push(pool[i]);
   return groups;
 }
+const renderQueueKey = (jobId: string, priority: boolean, queuedAt = Date.now()) =>
+  `render-queue/${priority ? "0" : "1"}/${String(queuedAt).padStart(13, "0")}/${jobId}`;
+const renderActiveKey = (jobId: string) => `render-active/${jobId}`;
+async function enqueueRender(env: Env, job: RenderJob) {
+  const meta: QueueMeta = { chatId: job.chatId, statusMessageId: job.statusMessageId, language: await getLanguage(env, job.chatId), lastPosition: 0 };
+  await env.MEDIA.put(renderQueueKey(job.jobId, Boolean(job.priority), job.queuedAt), JSON.stringify(meta), { httpMetadata: { contentType: "application/json" } });
+}
 async function startRender(env: Env, chatId: number) {
   const session = await getSession(env, chatId);
   if (!session || session.step !== "confirm" || !session.duration || !session.interval || !session.darkness || !session.vignette || !session.orderMode || !session.transition || !session.motion || !session.format || !session.effect || !session.templateName) return;
@@ -728,31 +769,29 @@ async function startRender(env: Env, chatId: number) {
   const [completedCount, totalRenderMs] = await Promise.all([metric(env, "completed"), metric(env, "render_ms")]);
   const averageSeconds = completedCount ? Math.max(30, totalRenderMs / completedCount / 1000) : 90;
   const etaMinutes = Math.max(1, Math.ceil((priority ? averageSeconds : averageSeconds * Math.max(1, pending)) / 60));
-  session.step = "rendering"; await putSession(env, chatId, session); await consumeDailyLimit(env, chatId, groups.length);
+  const settings: SavedSettings = { duration: session.duration, interval: session.interval, darkness: session.darkness, vignette: session.vignette, orderMode: session.orderMode, transition: session.transition, motion: session.motion, format: session.format, effect: session.effect, templateName: session.templateName };
+  session.step = "rendering";
+  await Promise.all([putSession(env, chatId, session), env.SESSIONS.put(lastSettingsKey(chatId), JSON.stringify(settings)), consumeDailyLimit(env, chatId, groups.length)]);
   const counterKey = dailyKey(chatId);
   const jobs: Array<{ job: RenderJob; token: string }> = [];
   for (let i = 0; i < groups.length; i++) {
     const jobId = crypto.randomUUID();
-    const status = await sendMessage(env, chatId, groups.length > 1 ? `⚙️ <b>Працюю… ${i + 1}/${groups.length}</b>\nПриблизно ${etaMinutes} хв.` : `⚙️ <b>Працюю…</b>\nПриблизно ${etaMinutes} хв.`) as { message_id: number };
+    const position = Math.max(1, pending - groups.length + i + 1);
+    const status = await sendMessage(env, chatId, groups.length > 1 ? `⏳ <b>Очікує в черзі ${i + 1}/${groups.length}</b>\nТвоє місце: ${position}. Приблизно ${etaMinutes} хв.` : `⏳ <b>Очікує в черзі</b>\nТвоє місце: ${position}. Приблизно ${etaMinutes} хв.`, {
+      inline_keyboard: [[{ text: "❌ Скасувати", callback_data: `cancel_job:${jobId}` }]],
+    }) as { message_id: number };
     const job: RenderJob = { jobId, chatId, imageKeys: groups[i], duration: session.duration, interval: session.interval, darkness: session.darkness, vignette: session.vignette, orderMode: session.orderMode, transition: session.transition, motion: session.motion, format: session.format, effect: session.effect, templateName: session.templateName, statusMessageId: status.message_id, dailyCounterKey: counterKey, queuedAt: Date.now(), priority };
     jobs.push({ job, token: crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "") });
   }
   await Promise.all([
     ...jobs.flatMap(({ job, token }) => [
-      env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "queued", chatId }), { expirationTtl: 86400 }),
+      env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "queued", chatId, updatedAt: Date.now() }), { expirationTtl: 86400 }),
       env.SESSIONS.put(`render-job:${job.jobId}`, JSON.stringify({ job, token }), { expirationTtl: 86400 }),
+      enqueueRender(env, job),
     ]),
     env.SESSIONS.put(`active-job:${chatId}`, jobs[0].job.jobId, { expirationTtl: 3600 }),
-    env.SESSIONS.put("queue:pending", String(pending)),
   ]);
-  if (priority) {
-    const dispatched = await Promise.allSettled(jobs.map(({ job, token }) => dispatchGitHubRender(env, job.jobId, token, true)));
-    for (let i = 0; i < dispatched.length; i++) if (dispatched[i].status === "rejected") await failRender(env, jobs[i].job, `Не вдалося запустити GitHub Actions: ${String((dispatched[i] as PromiseRejectedResult).reason)}`);
-  } else {
-    const queue = ((await env.SESSIONS.get("render:free-queue", "json")) as string[] | null) || [];
-    await env.SESSIONS.put("render:free-queue", JSON.stringify([...queue, ...jobs.map(({ job }) => job.jobId)]));
-  }
-  await Promise.all([incMetric(env, "total_jobs", groups.length), incMetric(env, `format:${session.format}`, groups.length)]);
+  await Promise.all([incMetric(env, "total_jobs", groups.length), incMetric(env, `format:${session.format}`, groups.length), incMetric(env, `user-jobs:${chatId}`, groups.length)]);
   if (pending >= QUEUE_ALERT_THRESHOLD) await alertAdmins(env, `Черга досягла ${pending} завдань.`);
 }
 async function askUserTemplateName(env: Env, chatId: number) {
@@ -883,7 +922,7 @@ async function registerReferral(env: Env, userId: number, payload: string) {
   const user = await env.SESSIONS.get<StoredUser>(userKey(userId), "json");
   if (!user || user.referrerId || user.referralQualified) return;
   user.referrerId = referrerId;
-  await env.SESSIONS.put(userKey(userId), JSON.stringify(user));
+  await Promise.all([env.SESSIONS.put(userKey(userId), JSON.stringify(user)), incMetric(env, `referral-clicks:${referrerId}`)]);
 }
 async function qualifyReferral(env: Env, userId: number) {
   const user = await env.SESSIONS.get<StoredUser>(userKey(userId), "json");
@@ -893,13 +932,15 @@ async function qualifyReferral(env: Env, userId: number) {
     env.SESSIONS.put(userKey(userId), JSON.stringify(user)),
     addLimitBoost(env, user.referrerId, 2, 30, `referral:${userId}`),
     incMetric(env, "qualified_referrals"),
+    incMetric(env, `referral-qualified:${user.referrerId}`),
   ]);
   try { await sendMessage(env, user.referrerId, "🎁 Друг створив перше відео! Твій денний ліміт збільшено на <b>+2 відео</b> протягом 30 днів."); } catch {}
 }
 async function showReferral(env: Env, chatId: number) {
   const link = `https://t.me/${BOT_USERNAME}?start=ref_${chatId}`;
   const boosts = (await activeBoosts(env, chatId)).filter((item) => item.source.startsWith("referral:"));
-  await sendMessage(env, chatId, `<b>🎁 Реферальна програма</b>\n\nЗапроси друга. Коли він створить перше відео, ти отримаєш <b>+2 відео щодня на 30 днів</b>.\n\nТвоє посилання:\n<code>${link}</code>\n\nАктивних бонусів: <b>${boosts.length}</b>.`, { inline_keyboard: [[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]] });
+  const [clicks, qualified] = await Promise.all([metric(env, `referral-clicks:${chatId}`), metric(env, `referral-qualified:${chatId}`)]);
+  await sendMessage(env, chatId, `<b>🎁 Реферальна програма</b>\n\nЗапроси друга. Коли він створить перше відео, ти отримаєш <b>+2 відео щодня на 30 днів</b>.\n\nТвоє посилання:\n<code>${link}</code>\n\n<b>📊 Реферальна статистика</b>\nПереходів: <b>${clicks}</b>\nАктивували бонус: <b>${qualified}</b>\nАктивних бонусів: <b>${boosts.length}</b>.`, { inline_keyboard: [[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]] });
 }
 async function buyPremium(env: Env, chatId: number) {
   const language = await getLanguage(env, chatId);
@@ -977,6 +1018,7 @@ async function promptAdmin(env: Env, chatId: number, action: Session["adminActio
     broadcast: "Надішли текст розсилки:",
     premium: "Надішли: <code>USER_ID КІЛЬКІСТЬ_ДНІВ</code>, наприклад <code>123456 30</code>",
     promo: "Надішли: <code>КОД ТИП ЗНАЧЕННЯ ВИКОРИСТАНЬ</code>\nТипи: <code>PREMIUM</code> (дні) або <code>VIDEOS</code> (+відео щодня на 30 днів).\nПриклад: <code>SALE PREMIUM 30 100</code>",
+    user_search: "Надішли Telegram ID, @username або ім’я користувача:",
   };
   await sendMessage(env, chatId, prompts[action!], { inline_keyboard: [[{ text: "⬅️ В адмін-панель", callback_data: "admin:home" }]] });
 }
@@ -987,6 +1029,7 @@ async function handleAdminInput(env: Env, chatId: number, session: Session, text
   else if (action === "block") await setBlocked(env, chatId, Number(text), true);
   else if (action === "unblock") await setBlocked(env, chatId, Number(text), false);
   else if (action === "broadcast") await broadcast(env, chatId, text);
+  else if (action === "user_search") await searchAdminUsers(env, chatId, text);
   else if (action === "premium") {
     const [idRaw, daysRaw] = text.trim().split(/\s+/); const id = Number(idRaw); const days = Number(daysRaw || 30);
     if (!id || !days) await sendMessage(env, chatId, "Неправильний формат.", adminKeyboard);
@@ -1033,14 +1076,57 @@ async function adminStats(env: Env, chatId: number) {
     adminKeyboard,
   );
 }
-async function adminUsers(env: Env, chatId: number) {
-  const ids = ((await env.SESSIONS.get("admin:recent_users", "json")) as number[] | null) || [];
-  const users = await Promise.all(ids.slice(0, 10).map((id) => env.SESSIONS.get<StoredUser>(userKey(id), "json")));
-  const lines = users.filter(Boolean).map((u) => {
-    const name = [u!.first_name, u!.last_name].filter(Boolean).join(" ") || "Без імені";
-    return `${u!.blocked ? "🚫" : "👤"} <code>${u!.id}</code> ${escapeHtml(name)}${u!.username ? ` @${escapeHtml(u!.username)}` : ""}`;
-  });
-  await sendMessage(env, chatId, `<b>Останні користувачі</b>\n\n${lines.join("\n") || "Ще немає користувачів."}\n\nКерування користувачами доступне кнопками в адмін-панелі.`, adminKeyboard);
+async function loadAllUsers(env: Env) {
+  let cursor: string | undefined; const users: StoredUser[] = [];
+  do {
+    const page = await env.SESSIONS.list({ prefix: "user:", cursor, limit: 1000 });
+    const loaded = await Promise.all(page.keys.map((key) => env.SESSIONS.get<StoredUser>(key.name, "json")));
+    users.push(...loaded.filter((user): user is StoredUser => Boolean(user)));
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return users.sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
+}
+async function adminUsers(env: Env, chatId: number, requestedPage = 0) {
+  const users = await loadAllUsers(env); const pageSize = 10;
+  const totalPages = Math.max(1, Math.ceil(users.length / pageSize));
+  const page = Math.max(0, Math.min(requestedPage, totalPages - 1));
+  const selected = users.slice(page * pageSize, page * pageSize + pageSize);
+  const details = await Promise.all(selected.map(async (user) => {
+    const [used, totalJobs, supporter] = await Promise.all([dailyUsed(env, user.id), metric(env, `user-jobs:${user.id}`), premiumUntil(env, user.id)]);
+    const name = [user.first_name, user.last_name].filter(Boolean).join(" ") || "Без імені";
+    return `${user.blocked ? "🚫" : "👤"}${supporter > Date.now() ? " ❤️" : ""} <code>${user.id}</code> ${escapeHtml(name)}${user.username ? ` @${escapeHtml(user.username)}` : ""}\n└ сьогодні: ${used}, усього: ${totalJobs}, активність: ${user.lastSeen.slice(0, 10)}`;
+  }));
+  const navigation: Array<Array<{text:string;callback_data:string}>> = [];
+  const row: Array<{text:string;callback_data:string}> = [];
+  if (page > 0) row.push({ text: "⬅️ Назад", callback_data: `admin:users:${page - 1}` });
+  if (page + 1 < totalPages) row.push({ text: "Далі ➡️", callback_data: `admin:users:${page + 1}` });
+  if (row.length) navigation.push(row);
+  navigation.push([{ text: "🔎 Пошук", callback_data: "admin:user_search" }], [{ text: "⬅️ В адмін-панель", callback_data: "admin:home" }]);
+  await sendMessage(env, chatId, `<b>👥 Усі користувачі</b>\nУсього: <b>${users.length}</b> · сторінка ${page + 1}/${totalPages}\n\n${details.join("\n\n") || "Ще немає користувачів."}`, { inline_keyboard: navigation });
+}
+async function searchAdminUsers(env: Env, chatId: number, query: string) {
+  const clean = query.trim().replace(/^@/, "").toLowerCase(); const users = await loadAllUsers(env);
+  const matches = users.filter((user) => String(user.id) === clean || (user.username || "").toLowerCase().includes(clean) || [user.first_name, user.last_name].filter(Boolean).join(" ").toLowerCase().includes(clean)).slice(0, 20);
+  const lines = matches.map((user) => `${user.blocked ? "🚫" : "👤"} <code>${user.id}</code> ${escapeHtml([user.first_name, user.last_name].filter(Boolean).join(" ") || "Без імені")}${user.username ? ` @${escapeHtml(user.username)}` : ""}`);
+  await sendMessage(env, chatId, `<b>🔎 Результати пошуку</b>\n\n${lines.join("\n") || "Нічого не знайдено."}`, { inline_keyboard: [[{ text: "🔎 Шукати ще", callback_data: "admin:user_search" }], [{ text: "👥 Усі користувачі", callback_data: "admin:users:0" }], [{ text: "⬅️ В адмін-панель", callback_data: "admin:home" }]] });
+}
+async function adminSystemStatus(env: Env, chatId: number) {
+  const [queue, active, storageBytes, lastCleanup, lastSuccess] = await Promise.all([
+    countR2Prefix(env, "render-queue/"), env.MEDIA.list({ prefix: "render-active/", limit: 1000 }),
+    env.SESSIONS.get("storage:last_bytes"), env.SESSIONS.get("storage:last_cleanup"), env.SESSIONS.get("system:last_success"),
+  ]);
+  let github = "⚠️ Недоступний";
+  try {
+    const monthStart = `${new Date().toISOString().slice(0, 7)}-01`;
+    const response = await fetch(`https://api.github.com/repos/${env.GITHUB_REPOSITORY}/actions/runs?created=%3E%3D${monthStart}&per_page=100`, { headers: { authorization: `Bearer ${env.GITHUB_TOKEN}`, accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", "user-agent": "tiktok-creo-bot" } });
+    const body = await response.json() as { total_count?:number; workflow_runs?:Array<{status:string}> };
+    github = response.ok ? `✅ працює · активних: ${(body.workflow_runs || []).filter((run) => run.status !== "completed").length} · запусків за місяць: ${body.total_count || 0}` : `⚠️ GitHub ${response.status}`;
+  } catch {}
+  const oldest = active.objects.length ? Math.max(...active.objects.map((object) => Math.floor((Date.now() - object.uploaded.getTime()) / 60000))) : 0;
+  await sendMessage(env, chatId, `<b>🩺 Стан бота</b>\n\nTelegram webhook: ✅\nCloudflare KV: ✅ запити оптимізовано\nGitHub Actions: ${github}\nУ черзі: <b>${queue}</b>\nАктивних рендерів: <b>${active.objects.length}/${MAX_CONCURRENT_RENDERS}</b>\nНайстаріший: <b>${oldest} хв</b>\nR2: <b>${(Number(storageBytes || 0) / 1024 / 1024).toFixed(1)} МБ</b>\nОстаннє очищення: <b>${lastCleanup ? lastCleanup.slice(0, 16) : "ще не було"}</b>\nОстанній успішний рендер: <b>${lastSuccess ? lastSuccess.slice(0, 16) : "ще не було"}</b>`, { inline_keyboard: [[{ text: "🔄 Оновити", callback_data: "admin:system" }], [{ text: "⬅️ В адмін-панель", callback_data: "admin:home" }]] });
+}
+async function adminSecurity(env: Env, chatId: number) {
+  await sendMessage(env, chatId, `<b>🔐 Безпека</b>\n\n✅ Webhook захищено секретом\n✅ Повторні запити блокуються\n✅ Deploy keys видаляються після деплою\n\n⚠️ Після деплою потрібно перевипустити Telegram Bot Token і GitHub Token.`, { inline_keyboard: [[{ text: "⬅️ В адмін-панель", callback_data: "admin:home" }]] });
 }
 async function adminErrors(env: Env, chatId: number) {
   const errors = ((await env.SESSIONS.get("admin:errors", "json")) as Array<{at:string;where:string;message:string}> | null) || [];
@@ -1097,7 +1183,7 @@ async function deleteMyData(env: Env, chatId: number) {
   await Promise.all([
     ...ids.map((id) => env.SESSIONS.delete(`user-template:${chatId}:${id}`)),
     env.SESSIONS.delete(indexKey), env.SESSIONS.delete(sessionKey(chatId)), env.SESSIONS.delete(userKey(chatId)), env.SESSIONS.delete(languageKey(chatId)),
-    env.SESSIONS.delete(dailyKey(chatId)), env.SESSIONS.delete(`premium:${chatId}`), env.SESSIONS.delete(`limit-boosts:${chatId}`),
+    env.SESSIONS.delete(dailyKey(chatId)), env.SESSIONS.delete(`premium:${chatId}`), env.SESSIONS.delete(`limit-boosts:${chatId}`), env.SESSIONS.delete(lastSettingsKey(chatId)),
     deletePrefix(env, `uploads/${chatId}/`), deletePrefix(env, `outputs/${chatId}/`),
   ]);
   languageCache.delete(chatId); userSeenCache.delete(chatId); blockedCache.delete(chatId);
@@ -1126,7 +1212,11 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
     if (data.startsWith("admin:") && isAdmin(env, callback.from.id)) {
       if (data === "admin:home") return sendMessage(env, chatId, "<b>🛠 Адмін-панель</b>", adminKeyboard);
       if (data === "admin:stats") return adminStats(env, chatId);
-      if (data === "admin:users") return adminUsers(env, chatId);
+      if (data === "admin:users") return adminUsers(env, chatId, 0);
+      if (data.startsWith("admin:users:")) return adminUsers(env, chatId, Number(data.split(":")[2]) || 0);
+      if (data === "admin:user_search") return promptAdmin(env, chatId, "user_search");
+      if (data === "admin:system") return adminSystemStatus(env, chatId);
+      if (data === "admin:security") return adminSecurity(env, chatId);
       if (data === "admin:errors") return adminErrors(env, chatId);
       if (data === "admin:clear_errors") { await env.SESSIONS.delete("admin:errors"); return sendMessage(env, chatId, "✅ Журнал помилок очищено.", adminKeyboard); }
       if (data === "admin:maintenance") {
@@ -1162,6 +1252,7 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
     if (data === "profile") return showProfile(env, chatId);
     if (data === "help") return showHelp(env, chatId);
     if (data === "create") return resetSession(env, chatId);
+    if (data === "quick_create") return startQuickCreation(env, chatId);
     if (data === "photos_restart") { const current = await getSession(env, chatId); return current?.batchCount ? resetBatchSession(env, chatId, current.batchCount) : resetSession(env, chatId); }
     if (data === "back") return goBack(env, chatId);
     if (data.startsWith("cancel_job:")) return cancelJob(env, chatId, data.split(":")[1]);
@@ -1221,6 +1312,21 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
   await sendMessage(env, chatId, "Скористайся кнопкою нижче.", createKeyboard);
 }
 
+async function isDuplicateTelegramUpdate(request: Request, update: TelegramUpdate) {
+  if (typeof update.update_id !== "number") return false;
+  const now = Date.now();
+  if ((recentUpdateIds.get(update.update_id) || 0) > now) return true;
+  recentUpdateIds.set(update.update_id, now + 60 * 60 * 1000);
+  if (recentUpdateIds.size > 5000) for (const [id, expiresAt] of recentUpdateIds) if (expiresAt <= now) recentUpdateIds.delete(id);
+  try {
+    const cache = await caches.open("telegram-dedupe");
+    const cacheRequest = new Request(`${new URL(request.url).origin}/_telegram-update/${update.update_id}`);
+    if (await cache.match(cacheRequest)) return true;
+    await cache.put(cacheRequest, new Response("1", { headers: { "cache-control": "public, max-age=3600" } }));
+  } catch {}
+  return false;
+}
+
 async function sendVideo(env: Env, chatId: number, video: ArrayBuffer, duration: number, jobId: string) {
   const language = await getLanguage(env, chatId);
   const form = new FormData(); form.append("chat_id", String(chatId)); form.append("supports_streaming", "true");
@@ -1252,34 +1358,28 @@ async function loadRenderJob(env: Env, jobId: string, token: string | null) {
   if (!stored || stored.token !== token) return null;
   return stored;
 }
-async function decrementPending(env: Env) {
-  const pending = Math.max(0, Number((await env.SESSIONS.get("queue:pending")) || 1) - 1);
-  await env.SESSIONS.put("queue:pending", String(pending));
+async function countR2Prefix(env: Env, prefix: string) {
+  let cursor: string | undefined; let total = 0;
+  do {
+    const page = await env.MEDIA.list({ prefix, cursor, limit: 1000 });
+    total += page.objects.length;
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return total;
 }
 async function actualPendingJobs(env: Env) {
-  let cursor: string | undefined;
-  let pending = 0;
-  do {
-    const page = await env.SESSIONS.list({ prefix: "job:", cursor, limit: 1000 });
-    const states = await Promise.all(page.keys.map((key) => env.SESSIONS.get<{status:string}>(key.name, "json")));
-    const active = page.keys
-      .map((key, index) => ({ jobId: key.name.slice(4), state: states[index] }))
-      .filter(({ state }) => state && ["queued", "rendering", "uploading"].includes(state.status));
-    const stored = await Promise.all(active.map(({ jobId }) => env.SESSIONS.get<StoredRenderJob>(`render-job:${jobId}`, "json")));
-    pending += stored.filter((item) => item && Date.now() - item.job.queuedAt < 2 * 60 * 60 * 1000).length;
-    cursor = page.list_complete ? undefined : page.cursor;
-  } while (cursor);
-  await env.SESSIONS.put("queue:pending", String(pending));
-  return pending;
+  const [queued, active] = await Promise.all([countR2Prefix(env, "render-queue/"), countR2Prefix(env, "render-active/")]);
+  return queued + active;
 }
 async function failRender(env: Env, job: RenderJob, detail: string) {
   const state = await env.SESSIONS.get<{status:string}>(`job:${job.jobId}`, "json");
   if (state?.status === "failed" || state?.status === "done") return;
   await Promise.all([
-    decrementPending(env), removeImages(env, job.imageKeys), env.SESSIONS.delete(sessionKey(job.chatId)),
+    removeImages(env, job.imageKeys), env.SESSIONS.delete(sessionKey(job.chatId)),
     env.SESSIONS.delete(`active-job:${job.chatId}`), env.SESSIONS.delete(`render-job:${job.jobId}`),
+    env.MEDIA.delete(renderActiveKey(job.jobId)),
     refundDailyLimit(env, job.dailyCounterKey),
-    env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "failed", chatId: job.chatId }), { expirationTtl: 86400 }),
+    env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "failed", chatId: job.chatId, updatedAt: Date.now() }), { expirationTtl: 86400 }),
     incMetric(env, "failed"), incDailyMetric(env, "failed"), recordError(env, "github_render", detail),
   ]);
   await Promise.all([
@@ -1288,19 +1388,43 @@ async function failRender(env: Env, job: RenderJob, detail: string) {
     alertAdmins(env, `Рендер ${job.jobId} завершився помилкою: ${detail}`),
   ]);
 }
+async function retryOrFailRender(env: Env, stored: StoredRenderJob, detail: string) {
+  const { job } = stored;
+  const state = await env.SESSIONS.get<{status:string}>(`job:${job.jobId}`, "json");
+  if (state?.status === "done" || state?.status === "failed" || state?.status === "cancelled") return;
+  if ((job.retryCount || 0) >= 1) return failRender(env, job, detail);
+  job.retryCount = 1; job.queuedAt = Date.now();
+  await Promise.all([
+    env.MEDIA.delete(renderActiveKey(job.jobId)),
+    env.SESSIONS.put(`render-job:${job.jobId}`, JSON.stringify({ ...stored, job }), { expirationTtl: 86400 }),
+    env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "queued", chatId: job.chatId, updatedAt: Date.now() }), { expirationTtl: 86400 }),
+    enqueueRender(env, job), incMetric(env, "retried"),
+    editMessage(env, job.chatId, job.statusMessageId, "🔄 <b>Сталася тимчасова помилка. Автоматично повторюю рендер…</b>"),
+  ]);
+}
+async function finalizeCancelledRender(env: Env, stored: StoredRenderJob) {
+  const { job } = stored;
+  await Promise.all([
+    removeImages(env, job.imageKeys), refundDailyLimit(env, job.dailyCounterKey),
+    env.SESSIONS.delete(`active-job:${job.chatId}`), env.SESSIONS.delete(sessionKey(job.chatId)),
+    env.SESSIONS.delete(`render-job:${job.jobId}`), env.MEDIA.delete(renderActiveKey(job.jobId)),
+    env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "cancelled", chatId: job.chatId, updatedAt: Date.now() }), { expirationTtl: 86400 }),
+  ]);
+  await editMessage(env, job.chatId, job.statusMessageId, "❌ <b>Створення скасовано. Ліміт повернуто.</b>");
+}
 async function completeRender(env: Env, stored: StoredRenderJob, request: Request) {
   const { job } = stored;
   const state = await env.SESSIONS.get<{status:string}>(`job:${job.jobId}`, "json");
+  if (state?.status === "done" || state?.status === "failed") return json({ ok: true, duplicate: true });
   if (state?.status === "cancelled") {
-    await Promise.all([decrementPending(env), removeImages(env, job.imageKeys), refundDailyLimit(env, job.dailyCounterKey), env.SESSIONS.delete(`active-job:${job.chatId}`), env.SESSIONS.delete(sessionKey(job.chatId)), env.SESSIONS.delete(`render-job:${job.jobId}`)]);
-    await editMessage(env, job.chatId, job.statusMessageId, "❌ <b>Створення скасовано. Ліміт повернуто.</b>");
+    await finalizeCancelledRender(env, stored);
     return json({ ok: true, cancelled: true });
   }
   if (!request.body) return json({ error: "empty video" }, 400);
   const contentLength = Number(request.headers.get("content-length") || 0);
   if (contentLength > 50 * 1024 * 1024) return json({ error: "video too large" }, 413);
   const outputKey = `outputs/${job.chatId}/${job.jobId}.mp4`;
-  await env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "uploading", chatId: job.chatId }), { expirationTtl: 86400 });
+  await env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "uploading", chatId: job.chatId, updatedAt: Date.now() }), { expirationTtl: 86400 });
   await editMessage(env, job.chatId, job.statusMessageId, "📤 <b>Надсилаю…</b>");
   const video = await request.arrayBuffer();
   await Promise.all([
@@ -1309,29 +1433,84 @@ async function completeRender(env: Env, stored: StoredRenderJob, request: Reques
   ]);
   const renderMs = Date.now() - job.queuedAt;
   await Promise.all([
-    decrementPending(env), removeImages(env, job.imageKeys), env.SESSIONS.delete(sessionKey(job.chatId)),
+    removeImages(env, job.imageKeys), env.SESSIONS.delete(sessionKey(job.chatId)),
     env.SESSIONS.delete(`active-job:${job.chatId}`), env.SESSIONS.delete(`render-job:${job.jobId}`),
-    env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "done", chatId: job.chatId }), { expirationTtl: 86400 }),
+    env.MEDIA.delete(renderActiveKey(job.jobId)),
+    env.SESSIONS.put(`job:${job.jobId}`, JSON.stringify({ status: "done", chatId: job.chatId, updatedAt: Date.now() }), { expirationTtl: 86400 }),
     incMetric(env, "completed"), incMetric(env, "rendered_seconds", job.duration), incMetric(env, "render_ms", renderMs),
-    incMetric(env, "output_bytes", video.byteLength), incDailyMetric(env, "completed"),
+    incMetric(env, "output_bytes", video.byteLength), incDailyMetric(env, "completed"), env.SESSIONS.put("system:last_success", new Date().toISOString()),
   ]);
   await qualifyReferral(env, job.chatId);
   await sendMessage(env, job.chatId, "Можеш створити наступне відео 👇", createKeyboard);
   return json({ ok: true });
 }
 
-async function processFreeRenderQueue(env: Env) {
-  const queue = ((await env.SESSIONS.get("render:free-queue", "json")) as string[] | null) || [];
-  if (!queue.length) return;
-  const valid: string[] = [];
-  for (const jobId of queue) if (await env.SESSIONS.get(`render-job:${jobId}`)) valid.push(jobId);
-  const selected = valid.slice(0, 2);
-  await env.SESSIONS.put("render:free-queue", JSON.stringify(valid.slice(selected.length)));
-  for (const jobId of selected) {
+async function migrateLegacyQueue(env: Env) {
+  const legacy = ((await env.SESSIONS.get("render:free-queue", "json")) as string[] | null) || [];
+  if (!legacy.length) return;
+  for (const jobId of legacy) {
     const stored = await env.SESSIONS.get<StoredRenderJob>(`render-job:${jobId}`, "json");
-    if (!stored) continue;
-    try { await dispatchGitHubRender(env, jobId, stored.token, false); }
-    catch (error) { await failRender(env, stored.job, `Не вдалося запустити безкоштовну чергу: ${String(error)}`); }
+    if (stored) await enqueueRender(env, stored.job);
+  }
+  await env.SESSIONS.delete("render:free-queue");
+}
+async function updateQueuePositions(env: Env) {
+  const queued = [
+    ...(await env.MEDIA.list({ prefix: "render-queue/0/", limit: 100 })).objects,
+    ...(await env.MEDIA.list({ prefix: "render-queue/1/", limit: 100 })).objects,
+  ];
+  for (let index = 0; index < queued.length; index++) {
+    const marker = queued[index]; const position = index + 1;
+    const object = await env.MEDIA.get(marker.key); if (!object) continue;
+    const meta = await object.json<QueueMeta>();
+    if (meta.lastPosition === position) continue;
+    const text = localizeText(`⏳ <b>Очікує в черзі</b>\nТвоє місце: ${position}.`, meta.language);
+    try {
+      await telegram(env, "editMessageText", { chat_id: meta.chatId, message_id: meta.statusMessageId, text, parse_mode: "HTML", reply_markup: { inline_keyboard: [[{ text: localizeText("❌ Скасувати", meta.language), callback_data: `cancel_job:${marker.key.split("/").pop()}` }]] } });
+      meta.lastPosition = position;
+      await env.MEDIA.put(marker.key, JSON.stringify(meta), { httpMetadata: { contentType: "application/json" } });
+    } catch {}
+  }
+}
+async function recoverStaleRenders(env: Env) {
+  const active = await env.MEDIA.list({ prefix: "render-active/", limit: 1000 });
+  for (const marker of active.objects) {
+    const age = Date.now() - marker.uploaded.getTime();
+    const jobId = marker.key.slice("render-active/".length);
+    const stored = await env.SESSIONS.get<StoredRenderJob>(`render-job:${jobId}`, "json");
+    if (!stored) { await env.MEDIA.delete(marker.key); continue; }
+    const state = await env.SESSIONS.get<{status:string}>(`job:${jobId}`, "json");
+    if (state?.status === "cancelled") { await finalizeCancelledRender(env, stored); continue; }
+    if (state?.status === "done" || state?.status === "failed") { await env.MEDIA.delete(marker.key); continue; }
+    if (age > 10 * 60 * 1000 && age < 12 * 60 * 1000) {
+      try { await editMessage(env, stored.job.chatId, stored.job.statusMessageId, "⏱ <b>Рендер затримався, але працює і не завис.</b>"); } catch {}
+    }
+    if (age >= RENDER_TIMEOUT_MS) {
+      await env.MEDIA.delete(marker.key);
+      await retryOrFailRender(env, stored, "Рендер перевищив максимальний час.");
+    }
+  }
+}
+async function processRenderQueue(env: Env) {
+  await migrateLegacyQueue(env); await recoverStaleRenders(env); await updateQueuePositions(env);
+  const active = await env.MEDIA.list({ prefix: "render-active/", limit: 1000 });
+  let slots = Math.max(0, MAX_CONCURRENT_RENDERS - active.objects.length); if (!slots) return;
+  const queued = [...(await env.MEDIA.list({ prefix: "render-queue/0/", limit: 100 })).objects, ...(await env.MEDIA.list({ prefix: "render-queue/1/", limit: 100 })).objects];
+  for (const marker of queued) {
+    if (slots <= 0) break;
+    const jobId = marker.key.split("/").pop() || "";
+    const stored = await env.SESSIONS.get<StoredRenderJob>(`render-job:${jobId}`, "json");
+    if (!stored) { await env.MEDIA.delete(marker.key); continue; }
+    const state = await env.SESSIONS.get<{status:string}>(`job:${jobId}`, "json");
+    if (state?.status === "cancelled") { await env.MEDIA.delete(marker.key); await finalizeCancelledRender(env, stored); continue; }
+    if (state?.status === "done" || state?.status === "failed") { await env.MEDIA.delete(marker.key); continue; }
+    await Promise.all([
+      env.MEDIA.delete(marker.key), env.MEDIA.put(renderActiveKey(jobId), String(Date.now())),
+      env.SESSIONS.put(`job:${jobId}`, JSON.stringify({ status: "dispatching", chatId: stored.job.chatId, updatedAt: Date.now() }), { expirationTtl: 86400 }),
+      editMessage(env, stored.job.chatId, stored.job.statusMessageId, "🚀 <b>Запускаю рендер…</b>"),
+    ]);
+    try { await dispatchGitHubRender(env, jobId, stored.token, Boolean(stored.job.priority)); slots--; }
+    catch (error) { await env.MEDIA.delete(renderActiveKey(jobId)); await retryOrFailRender(env, stored, `Не вдалося запустити GitHub Actions: ${String(error)}`); }
   }
 }
 async function cleanupStorage(env: Env) {
@@ -1349,6 +1528,20 @@ async function cleanupStorage(env: Env) {
   await Promise.all([env.SESSIONS.put("storage:last_bytes", String(totalBytes)), env.SESSIONS.put("storage:last_cleanup", new Date().toISOString())]);
   if (totalBytes >= STORAGE_ALERT_BYTES) await alertAdmins(env, `R2 займає приблизно ${(totalBytes / 1024 / 1024 / 1024).toFixed(2)} ГБ. Видалено прострочених файлів: ${deleted}.`);
 }
+async function checkGitHubUsage(env: Env) {
+  const last = Date.parse((await env.SESSIONS.get("system:last_github_check")) || "0");
+  if (Number.isFinite(last) && Date.now() - last < 6 * 60 * 60 * 1000) return;
+  const month = new Date().toISOString().slice(0, 7);
+  const response = await fetch(`https://api.github.com/repos/${env.GITHUB_REPOSITORY}/actions/runs?created=%3E%3D${month}-01&per_page=1`, { headers: { authorization: `Bearer ${env.GITHUB_TOKEN}`, accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", "user-agent": "tiktok-creo-bot" } });
+  await env.SESSIONS.put("system:last_github_check", new Date().toISOString());
+  if (!response.ok) return;
+  const body = await response.json() as { total_count?:number }; const runs = body.total_count || 0;
+  const key = `system:github_alert:${month}`;
+  if (runs >= 1600 && !await env.SESSIONS.get(key)) {
+    await env.SESSIONS.put(key, "1", { expirationTtl: 40 * 86400 });
+    await alertAdmins(env, `GitHub Actions запущено ${runs} разів цього місяця. Перевір безкоштовні хвилини в GitHub Billing.`);
+  }
+}
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -1358,17 +1551,19 @@ export default {
       const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
       if (!env.WEBHOOK_SECRET || secret !== env.WEBHOOK_SECRET) return json({ error: "unauthorized" }, 401);
       const update = (await request.json()) as TelegramUpdate;
+      if (await isDuplicateTelegramUpdate(request, update)) return json({ ok: true, duplicate: true });
       ctx.waitUntil(handleUpdate(env, update).catch(async (error) => { console.error("Update failed", error); await recordError(env, "telegram_update", error); }));
       return json({ ok: true });
     }
-    const match = url.pathname.match(/^\/github\/render\/([0-9a-f-]+)\/(job|image\/([0-9]+)|complete|failed)$/);
+    const match = url.pathname.match(/^\/github\/render\/([0-9a-f-]+)\/(job|image\/([0-9]+)|stage|complete|failed)$/);
     if (match) {
       const [, jobId, action, imageIndex] = match;
       const token = request.headers.get("X-Render-Token") || url.searchParams.get("token");
       const stored = await loadRenderJob(env, jobId, token);
       if (!stored) return json({ error: "unauthorized" }, 401);
       if (action === "job" && request.method === "GET") {
-        await env.SESSIONS.put(`job:${jobId}`, JSON.stringify({ status: "rendering", chatId: stored.job.chatId }), { expirationTtl: 86400 });
+        await env.SESSIONS.put(`job:${jobId}`, JSON.stringify({ status: "downloading", chatId: stored.job.chatId, updatedAt: Date.now() }), { expirationTtl: 86400 });
+        await editMessage(env, stored.job.chatId, stored.job.statusMessageId, "📥 <b>Завантажую фото…</b>");
         return json({ ...stored.job, imageCount: stored.job.imageKeys.length, imageKeys: undefined, dailyCounterKey: undefined });
       }
       if (action.startsWith("image/") && request.method === "GET") {
@@ -1377,19 +1572,25 @@ export default {
         const object = await env.MEDIA.get(key); if (!object) return json({ error: "image missing" }, 404);
         return new Response(object.body, { headers: { "content-type": object.httpMetadata?.contentType || "image/jpeg" } });
       }
+      if (action === "stage" && request.method === "POST") {
+        await env.SESSIONS.put(`job:${jobId}`, JSON.stringify({ status: "rendering", chatId: stored.job.chatId, updatedAt: Date.now() }), { expirationTtl: 86400 });
+        await editMessage(env, stored.job.chatId, stored.job.statusMessageId, "⚙️ <b>Створюю відео…</b>");
+        return json({ ok: true });
+      }
       if (action === "complete" && request.method === "POST") {
         try { return await completeRender(env, stored, request); }
-        catch (error) { await failRender(env, stored.job, String(error)); return json({ error: "completion failed" }, 500); }
+        catch (error) { await retryOrFailRender(env, stored, String(error)); return json({ error: "completion failed" }, 500); }
       }
       if (action === "failed" && request.method === "POST") {
-        const body = await request.text(); await failRender(env, stored.job, body.slice(0, 1000)); return json({ ok: true });
+        const body = await request.text(); await retryOrFailRender(env, stored, body.slice(0, 1000)); return json({ ok: true });
       }
       return json({ error: "method not allowed" }, 405);
     }
     return new Response("TikTok Creo Bot is running", { status: 200 });
   },
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
-    await processFreeRenderQueue(env);
+    await processRenderQueue(env);
+    await checkGitHubUsage(env);
     const lastCleanup = Date.parse((await env.SESSIONS.get("storage:last_cleanup")) || "0");
     if (!Number.isFinite(lastCleanup) || Date.now() - lastCleanup > 15 * 60 * 1000) await cleanupStorage(env);
   },

@@ -350,7 +350,7 @@ const EN_REPLACEMENTS: Array<[string, string]> = [
   ["Не вдалося обробити фото. Спробуй інше фото або пізніше", "Could not process the photo. Try another photo or later"],
   ["Це не схоже на фото", "This does not look like a photo"], ["Можеш надіслати ще фото", "You can send more photos"],
   ["Оригінал вже видалено. Надішли фото ще раз", "The original was deleted. Send the photo again"],
-  ["Мова", "Language"], ["сек", "sec"],
+  ["Мова", "Language"], ["сек", "sec"], ["🏠 Меню", "🏠 Menu"],
 ];
 
 function localizeText(text: string, language: Language) {
@@ -483,6 +483,7 @@ const batchCountKeyboard = { inline_keyboard: [
 const photosKeyboard = { inline_keyboard: [
   [{ text: "✅ Далі", callback_data: "photos_done" }],
   [{ text: "🗑 Почати заново", callback_data: "photos_restart" }],
+  [{ text: "🏠 Меню", callback_data: "main_menu" }],
 ] };
 const durationKeyboard = { inline_keyboard: [
   [10, 15, 30, 60].map((n) => ({ text: `${n} сек`, callback_data: `duration:${n}` })),

@@ -8,6 +8,59 @@ interface Env {
   GITHUB_REPOSITORY: string;
   WORKER_BASE_URL: string;
   IMAGES: ImagesBinding;
+  DB?: D1Database;
+}
+
+// --- D1-backed storage with KVNamespace-compatible API (replaces Workers KV; falls back to KV until migration is done)
+let kvMigrated = false;
+const KV_MIGRATED_KEY = "system:kv_migrated";
+function d1Store(db: D1Database, legacy: KVNamespace) {
+  const alive = "(expires_at IS NULL OR expires_at > ?)";
+  const migrated = async () => {
+    if (kvMigrated) return true;
+    const row = await db.prepare("SELECT 1 FROM kv WHERE key = ? AND value IS NOT NULL").bind(KV_MIGRATED_KEY).first();
+    return (kvMigrated = Boolean(row));
+  };
+  const parse = (value: string | null, type?: unknown) => {
+    if (value === null) return null;
+    const kind = typeof type === "string" ? type : (type as { type?: string } | undefined)?.type;
+    return kind === "json" ? JSON.parse(value) : value;
+  };
+  const store = {
+    async get(key: string, type?: unknown) {
+      const row = await db.prepare(`SELECT value, expires_at FROM kv WHERE key = ?`).bind(key).first<{ value: string | null; expires_at: number | null }>();
+      if (row) return parse(row.expires_at !== null && row.expires_at <= Date.now() ? null : row.value, type);
+      if (await migrated()) return null;
+      const legacyValue = await legacy.get(key);
+      return parse(legacyValue, type);
+    },
+    async put(key: string, value: string | ArrayBuffer, options?: { expirationTtl?: number; expiration?: number; metadata?: unknown }) {
+      const expiresAt = options?.expirationTtl ? Date.now() + options.expirationTtl * 1000 : options?.expiration ? options.expiration * 1000 : null;
+      const text = typeof value === "string" ? value : new TextDecoder().decode(value);
+      await db.prepare("INSERT OR REPLACE INTO kv (key, value, expires_at, metadata) VALUES (?, ?, ?, ?)")
+        .bind(key, text, expiresAt, options?.metadata === undefined ? null : JSON.stringify(options.metadata)).run();
+    },
+    async delete(key: string) {
+      if (await migrated()) await db.prepare("DELETE FROM kv WHERE key = ?").bind(key).run();
+      else await db.prepare("INSERT OR REPLACE INTO kv (key, value, expires_at, metadata) VALUES (?, NULL, ?, NULL)").bind(key, Date.now() + 7 * 86400000).run();
+    },
+    async list(options?: { prefix?: string; cursor?: string | null; limit?: number }) {
+      const prefix = options?.prefix || ""; const limit = Math.min(Math.max(options?.limit || 1000, 1), 1000);
+      const { results } = await db.prepare(`SELECT key, metadata, expires_at FROM kv WHERE substr(key, 1, ?) = ? AND key > ? AND value IS NOT NULL AND ${alive} ORDER BY key LIMIT ?`)
+        .bind(prefix.length, prefix, options?.cursor || "", Date.now(), limit + 1).all<{ key: string; metadata: string | null; expires_at: number | null }>();
+      const page = results.slice(0, limit); const more = results.length > limit;
+      return {
+        keys: page.map((r) => ({ name: r.key, ...(r.expires_at ? { expiration: Math.floor(r.expires_at / 1000) } : {}), ...(r.metadata ? { metadata: JSON.parse(r.metadata) } : {}) })),
+        list_complete: !more, ...(more ? { cursor: page[page.length - 1].key } : {}), cacheStatus: null,
+      };
+    },
+    async cleanup() { await db.prepare("DELETE FROM kv WHERE expires_at IS NOT NULL AND expires_at <= ?").bind(Date.now()).run(); },
+  };
+  return store;
+}
+function withStorage(env: Env): Env {
+  if (!env.DB || (env.SESSIONS as unknown as { cleanup?: unknown }).cleanup) return env;
+  return { ...env, SESSIONS: d1Store(env.DB, env.SESSIONS) as unknown as KVNamespace };
 }
 
 type Step = "photos" | "template" | "duration" | "speed" | "darkness" | "vignette" | "order" | "transition" | "motion" | "effect" | "format" | "confirm" | "template_name" | "template_rename" | "template_copy" | "promo_input" | "feedback_input" | "admin_input" | "rendering" | "uniq";
@@ -1826,6 +1879,8 @@ async function cleanupStorage(env: Env) {
     if (expired.length) { await env.MEDIA.delete(expired.map((o) => o.key)); deleted += expired.length; }
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
+  const store = env.SESSIONS as unknown as { cleanup?: () => Promise<void> };
+  if (store.cleanup) await store.cleanup().catch((error) => console.error("D1 cleanup failed", error));
   await Promise.all([env.SESSIONS.put("storage:last_bytes", String(totalBytes)), env.SESSIONS.put("storage:last_cleanup", new Date().toISOString())]);
   if (totalBytes >= STORAGE_ALERT_BYTES) await alertAdmins(env, `R2 займає приблизно ${(totalBytes / 1024 / 1024 / 1024).toFixed(2)} ГБ. Видалено прострочених файлів: ${deleted}.`);
 }
@@ -1845,7 +1900,8 @@ async function checkGitHubUsage(env: Env) {
 }
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, rawEnv: Env, ctx: ExecutionContext): Promise<Response> {
+    const env = withStorage(rawEnv);
     const url = new URL(request.url);
     if (url.pathname === "/health") return json({ ok: true });
     if (url.pathname === "/telegram/webhook" && request.method === "POST") {
@@ -1889,7 +1945,8 @@ export default {
     }
     return new Response("TikTok Creo Bot is running", { status: 200 });
   },
-  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+  async scheduled(_controller: ScheduledController, rawEnv: Env): Promise<void> {
+    const env = withStorage(rawEnv);
     await processRenderQueue(env);
     await checkGitHubUsage(env);
     const lastCleanup = Date.parse((await env.SESSIONS.get("storage:last_cleanup")) || "0");

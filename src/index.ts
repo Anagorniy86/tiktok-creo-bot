@@ -7,9 +7,10 @@ interface Env {
   GITHUB_TOKEN: string;
   GITHUB_REPOSITORY: string;
   WORKER_BASE_URL: string;
+  IMAGES: ImagesBinding;
 }
 
-type Step = "photos" | "template" | "duration" | "speed" | "darkness" | "vignette" | "order" | "transition" | "motion" | "effect" | "format" | "confirm" | "template_name" | "template_rename" | "template_copy" | "promo_input" | "feedback_input" | "admin_input" | "rendering";
+type Step = "photos" | "template" | "duration" | "speed" | "darkness" | "vignette" | "order" | "transition" | "motion" | "effect" | "format" | "confirm" | "template_name" | "template_rename" | "template_copy" | "promo_input" | "feedback_input" | "admin_input" | "rendering" | "uniq";
 type Darkness = "none" | "light" | "standard" | "strong";
 type Vignette = "none" | "light" | "standard" | "strong";
 type OrderMode = "original" | "shuffle_once" | "random_no_repeat";
@@ -68,6 +69,7 @@ interface TelegramUpdate {
     from?: TgUser;
     text?: string;
     photo?: Array<{ file_id: string; file_size?: number }>;
+    document?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
     media_group_id?: string;
     successful_payment?: { invoice_payload: string; currency: string; total_amount: number };
   };
@@ -107,7 +109,8 @@ const RATE_LIMIT_PER_MINUTE = 60;
 const OUTPUT_TTL_MS = 60 * 60 * 1000;
 const UPLOAD_TTL_MS = 6 * 60 * 60 * 1000;
 const QUEUE_ALERT_THRESHOLD = 20;
-const MAX_CONCURRENT_RENDERS = 2;
+const MAX_CONCURRENT_RENDERS = 4;
+const UNIQ_DAILY_LIMIT = 30;
 const RENDER_TIMEOUT_MS = 20 * 60 * 1000;
 const STORAGE_ALERT_BYTES = 5 * 1024 * 1024 * 1024;
 const apiUrl = (env: Env, method: string) => `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`;
@@ -259,6 +262,18 @@ const RU_REPLACEMENTS: Array<[string, string]> = [
   ["Усі функції доступні кнопками", "Все функции доступны кнопками"],
   ["Забагато дій. Спробуй через хвилину", "Слишком много действий. Попробуй через минуту"],
   ["Бот тимчасово оновлюється. Спробуй пізніше", "Бот временно обновляется. Попробуй позже"],
+  ["Унікалізація фото", "Уникализация фото"],
+  ["Надішли 1 фото", "Отправь 1 фото"],
+  ["Краще надсилай як файл — без стиснення Telegram", "Лучше отправляй как файл — без сжатия Telegram"],
+  ["Я зроблю унікальну копію: легке кадрування, колір, різкість, нові метадані", "Я сделаю уникальную копию: лёгкое кадрирование, цвет, резкость, новые метаданные"],
+  ["Унікальна копія готова", "Уникальная копия готова"],
+  ["Ще варіант", "Ещё вариант"],
+  ["Обробляю фото", "Обрабатываю фото"],
+  ["Ліміт унікалізації на сьогодні вичерпано", "Лимит уникализации на сегодня исчерпан"],
+  ["Не вдалося обробити фото. Спробуй інше фото або пізніше", "Не удалось обработать фото. Попробуй другое фото или позже"],
+  ["Це не схоже на фото", "Это не похоже на фото"],
+  ["Можеш надіслати ще фото", "Можешь отправить ещё фото"],
+  ["Оригінал вже видалено. Надішли фото ще раз", "Оригинал уже удалён. Отправь фото ещё раз"],
   ["Мова", "Язык"],
 ];
 
@@ -315,6 +330,14 @@ const EN_REPLACEMENTS: Array<[string, string]> = [
   ["Безкоштовно", "Free"], ["Усі функції доступні кнопками", "All features are available through buttons"],
   ["Забагато дій. Спробуй через хвилину", "Too many actions. Try again in a minute"],
   ["Бот тимчасово оновлюється. Спробуй пізніше", "The bot is being updated. Try again later"],
+  ["Унікалізація фото", "Photo uniqualizer"], ["Надішли 1 фото", "Send 1 photo"],
+  ["Краще надсилай як файл — без стиснення Telegram", "Better send it as a file — no Telegram compression"],
+  ["Я зроблю унікальну копію: легке кадрування, колір, різкість, нові метадані", "I will make a unique copy: light crop, color, sharpness, new metadata"],
+  ["Унікальна копія готова", "Unique copy is ready"], ["Ще варіант", "Another variant"], ["Обробляю фото", "Processing photo"],
+  ["Ліміт унікалізації на сьогодні вичерпано", "Today's uniqualization limit is reached"],
+  ["Не вдалося обробити фото. Спробуй інше фото або пізніше", "Could not process the photo. Try another photo or later"],
+  ["Це не схоже на фото", "This does not look like a photo"], ["Можеш надіслати ще фото", "You can send more photos"],
+  ["Оригінал вже видалено. Надішли фото ще раз", "The original was deleted. Send the photo again"],
   ["Мова", "Language"], ["сек", "sec"],
 ];
 
@@ -425,6 +448,7 @@ async function isBlocked(env: Env, userId: number) {
 const createKeyboard = { inline_keyboard: [
   [{ text: "🎞 Створити одне відео", callback_data: "create" }],
   [{ text: "⚡ Швидке створення", callback_data: "quick_create" }],
+  [{ text: "🪄 Унікалізація фото", callback_data: "uniq" }],
   [{ text: "🎬 Створити декілька відео", callback_data: "batch_create" }],
   [{ text: "❤️ Подякувати автору — 100 Stars", callback_data: "buy_premium" }],
   [{ text: "🎁 Реферальна програма", callback_data: "referral" }, { text: "🎟 Промокод", callback_data: "promo" }],
@@ -649,6 +673,83 @@ async function acceptPhoto(env: Env, chatId: number, photos: Array<{ file_id: st
   const count = keys.length;
   await sendMessage(env, chatId, `✅ Фото прийнято: <b>${count}/${maxPhotos}</b>${count < minPhotos ? `\nПотрібно ще мінімум ${minPhotos - count}.` : "\nМожна переходити далі."}`, photosKeyboard);
 }
+const uniqSourceKey = (chatId: number) => `uniq/${chatId}/source`;
+const uniqKeyboard = { inline_keyboard: [
+  [{ text: "🔁 Ще варіант", callback_data: "uniq_again" }],
+  [{ text: "⬅️ Головне меню", callback_data: "main_menu" }],
+] };
+const rand = (min: number, max: number) => min + Math.random() * (max - min);
+const round3 = (value: number) => Math.round(value * 1000) / 1000;
+async function startUniq(env: Env, chatId: number) {
+  await putSession(env, chatId, { step: "uniq", imageKeys: [] });
+  await sendMessage(env, chatId, "<b>🪄 Унікалізація фото</b>\n\nНадішли 1 фото (можна кілька по черзі).\nЯ зроблю унікальну копію: легке кадрування, колір, різкість, нові метадані.\n\n💡 Краще надсилай як файл — без стиснення Telegram.", { inline_keyboard: [[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]] });
+}
+async function uniqAllowed(env: Env, chatId: number) {
+  if (isAdmin(env, chatId)) return true;
+  const key = `uniq-daily:${chatId}:${kyivDate()}`;
+  const used = Number((await env.SESSIONS.get(key)) || 0);
+  if (used >= UNIQ_DAILY_LIMIT) return false;
+  await env.SESSIONS.put(key, String(used + 1), { expirationTtl: 2 * 86400 });
+  return true;
+}
+async function renderUniqueVariant(env: Env, source: ArrayBuffer) {
+  const toStream = () => new Response(source).body as ReadableStream<Uint8Array>;
+  const info = await env.IMAGES.info(toStream());
+  if (!("width" in info) || !info.width || !info.height) throw new Error("not a raster image");
+  const { width, height } = info;
+  const trim = {
+    top: Math.round(height * rand(0.006, 0.025)), bottom: Math.round(height * rand(0.006, 0.025)),
+    left: Math.round(width * rand(0.006, 0.025)), right: Math.round(width * rand(0.006, 0.025)),
+  };
+  const trimmedWidth = width - trim.left - trim.right;
+  const targetWidth = Math.max(320, Math.round(trimmedWidth * rand(0.955, 0.995)));
+  const look = {
+    brightness: round3(rand(0.97, 1.04)), contrast: round3(rand(0.97, 1.05)),
+    saturation: round3(rand(0.94, 1.08)), gamma: round3(rand(0.97, 1.03)), sharpen: round3(rand(0.3, 1.4)),
+  };
+  const ghost = env.IMAGES.input(toStream())
+    .transform({ trim })
+    .transform({ width: targetWidth, fit: "scale-down" });
+  const result = await env.IMAGES.input(toStream())
+    .transform({ trim })
+    .transform({ width: targetWidth, fit: "scale-down" })
+    .transform(look)
+    .draw(ghost, { top: Math.round(rand(1, 4)), left: Math.round(rand(1, 4)), opacity: round3(rand(0.03, 0.07)) })
+    .output({ format: "image/jpeg", quality: Math.round(rand(88, 95)) });
+  return await result.response().arrayBuffer();
+}
+async function sendUniqueVariant(env: Env, chatId: number, source: ArrayBuffer) {
+  if (!await uniqAllowed(env, chatId)) return sendMessage(env, chatId, `⛔ Ліміт унікалізації на сьогодні вичерпано (${UNIQ_DAILY_LIMIT}).`, createKeyboard);
+  await telegram(env, "sendChatAction", { chat_id: chatId, action: "upload_document" }).catch(() => {});
+  let output: ArrayBuffer;
+  try { output = await renderUniqueVariant(env, source); }
+  catch (error) { await recordError(env, "uniq_photo", error); return sendMessage(env, chatId, "❌ Не вдалося обробити фото. Спробуй інше фото або пізніше.", uniqKeyboard); }
+  const language = await getLanguage(env, chatId);
+  const fileName = `IMG_${new Date().toISOString().slice(0, 10).replaceAll("-", "")}_${Math.floor(rand(1000, 9999))}.jpg`;
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("caption", localizeText("✅ Унікальна копія готова. Можеш надіслати ще фото.", language));
+  form.append("reply_markup", JSON.stringify(localizeMarkup(uniqKeyboard, language)));
+  form.append("document", new Blob([output], { type: "image/jpeg" }), fileName);
+  const response = await fetch(apiUrl(env, "sendDocument"), { method: "POST", body: form });
+  const body = (await response.json()) as { ok: boolean; description?: string };
+  if (!body.ok) throw new Error(body.description || "Telegram sendDocument failed");
+  await incMetric(env, "uniq_done");
+}
+async function acceptUniqPhoto(env: Env, chatId: number, fileId: string, fileSize = 0) {
+  if (fileSize > 15 * 1024 * 1024) return sendMessage(env, chatId, "Це фото завелике. Максимум — 15 МБ.");
+  const { data, ext } = await downloadTelegramPhoto(env, fileId);
+  if (data.byteLength > 15 * 1024 * 1024) return sendMessage(env, chatId, "Це фото завелике. Максимум — 15 МБ.");
+  await env.MEDIA.put(uniqSourceKey(chatId), data, { httpMetadata: { contentType: `image/${ext === "jpg" ? "jpeg" : ext}` } });
+  await sendUniqueVariant(env, chatId, data);
+}
+async function uniqAgain(env: Env, chatId: number) {
+  const object = await env.MEDIA.get(uniqSourceKey(chatId));
+  if (!object) return sendMessage(env, chatId, "Оригінал вже видалено. Надішли фото ще раз.", { inline_keyboard: [[{ text: "🪄 Унікалізація фото", callback_data: "uniq" }]] });
+  const session = await getSession(env, chatId);
+  if (session?.step !== "uniq") await putSession(env, chatId, { step: "uniq", imageKeys: [] });
+  await sendUniqueVariant(env, chatId, await object.arrayBuffer());
+}
 async function chooseCreationMode(env: Env, chatId: number) {
   const session = await getSession(env, chatId);
   if (!session) return sendMessage(env, chatId, "Спочатку натисни «Створити слайд-шоу».", createKeyboard);
@@ -792,6 +893,7 @@ async function startRender(env: Env, chatId: number) {
     env.SESSIONS.put(`active-job:${chatId}`, jobs[0].job.jobId, { expirationTtl: 3600 }),
   ]);
   await Promise.all([incMetric(env, "total_jobs", groups.length), incMetric(env, `format:${session.format}`, groups.length), incMetric(env, `user-jobs:${chatId}`, groups.length)]);
+  await dispatchQueuedRenders(env).catch((error) => recordError(env, "dispatch_now", error));
   if (pending >= QUEUE_ALERT_THRESHOLD) await alertAdmins(env, `Черга досягла ${pending} завдань.`);
 }
 async function askUserTemplateName(env: Env, chatId: number) {
@@ -1184,7 +1286,7 @@ async function deleteMyData(env: Env, chatId: number) {
     ...ids.map((id) => env.SESSIONS.delete(`user-template:${chatId}:${id}`)),
     env.SESSIONS.delete(indexKey), env.SESSIONS.delete(sessionKey(chatId)), env.SESSIONS.delete(userKey(chatId)), env.SESSIONS.delete(languageKey(chatId)),
     env.SESSIONS.delete(dailyKey(chatId)), env.SESSIONS.delete(`premium:${chatId}`), env.SESSIONS.delete(`limit-boosts:${chatId}`), env.SESSIONS.delete(lastSettingsKey(chatId)),
-    deletePrefix(env, `uploads/${chatId}/`), deletePrefix(env, `outputs/${chatId}/`),
+    deletePrefix(env, `uploads/${chatId}/`), deletePrefix(env, `outputs/${chatId}/`), deletePrefix(env, `uniq/${chatId}/`),
   ]);
   languageCache.delete(chatId); userSeenCache.delete(chatId); blockedCache.delete(chatId);
   await sendMessage(env, chatId, "✅ Твої файли, шаблони, сесія та профіль видалені.");
@@ -1253,6 +1355,8 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
     if (data === "help") return showHelp(env, chatId);
     if (data === "create") return resetSession(env, chatId);
     if (data === "quick_create") return startQuickCreation(env, chatId);
+    if (data === "uniq") return startUniq(env, chatId);
+    if (data === "uniq_again") return uniqAgain(env, chatId);
     if (data === "photos_restart") { const current = await getSession(env, chatId); return current?.batchCount ? resetBatchSession(env, chatId, current.batchCount) : resetSession(env, chatId); }
     if (data === "back") return goBack(env, chatId);
     if (data.startsWith("cancel_job:")) return cancelJob(env, chatId, data.split(":")[1]);
@@ -1296,6 +1400,15 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
     const payload = message.text.trim().split(/\s+/)[1] || ""; await registerReferral(env, userId, payload);
     const limit = await checkDailyLimit(env, userId);
     return sendMessage(env, chatId, `Привіт! Я створюю слайд-шоу без watermark. Безкоштовно доступно <b>10 відео на день</b>.\nСьогодні залишилося: <b>${leftLabel(limit)}</b>.`, createKeyboard);
+  }
+  const imageDocument = message.document && (message.document.mime_type || "").startsWith("image/") ? message.document : undefined;
+  if (message.photo?.length || message.document) {
+    const current = await getSession(env, chatId);
+    if (current?.step === "uniq") {
+      if (message.photo?.length) { const best = message.photo[message.photo.length - 1]; return acceptUniqPhoto(env, chatId, best.file_id, best.file_size); }
+      if (imageDocument) return acceptUniqPhoto(env, chatId, imageDocument.file_id, imageDocument.file_size);
+      return sendMessage(env, chatId, "Це не схоже на фото. Надішли JPG або PNG.");
+    }
   }
   if (message.photo?.length) return acceptPhoto(env, chatId, message.photo, message.media_group_id);
   if (message.text) {
@@ -1491,8 +1604,16 @@ async function recoverStaleRenders(env: Env) {
     }
   }
 }
-async function processRenderQueue(env: Env) {
-  await migrateLegacyQueue(env); await recoverStaleRenders(env); await updateQueuePositions(env);
+async function claimRender(env: Env, jobId: string) {
+  try {
+    const claimed = await env.MEDIA.put(renderActiveKey(jobId), String(Date.now()), { onlyIf: new Headers({ "If-None-Match": "*" }) });
+    return claimed !== null;
+  } catch {
+    await env.MEDIA.put(renderActiveKey(jobId), String(Date.now()));
+    return true;
+  }
+}
+async function dispatchQueuedRenders(env: Env) {
   const active = await env.MEDIA.list({ prefix: "render-active/", limit: 1000 });
   let slots = Math.max(0, MAX_CONCURRENT_RENDERS - active.objects.length); if (!slots) return;
   const queued = [...(await env.MEDIA.list({ prefix: "render-queue/0/", limit: 100 })).objects, ...(await env.MEDIA.list({ prefix: "render-queue/1/", limit: 100 })).objects];
@@ -1504,14 +1625,20 @@ async function processRenderQueue(env: Env) {
     const state = await env.SESSIONS.get<{status:string}>(`job:${jobId}`, "json");
     if (state?.status === "cancelled") { await env.MEDIA.delete(marker.key); await finalizeCancelledRender(env, stored); continue; }
     if (state?.status === "done" || state?.status === "failed") { await env.MEDIA.delete(marker.key); continue; }
+    if (!await claimRender(env, jobId)) continue; // already being dispatched by a parallel invocation
     await Promise.all([
-      env.MEDIA.delete(marker.key), env.MEDIA.put(renderActiveKey(jobId), String(Date.now())),
+      env.MEDIA.delete(marker.key),
       env.SESSIONS.put(`job:${jobId}`, JSON.stringify({ status: "dispatching", chatId: stored.job.chatId, updatedAt: Date.now() }), { expirationTtl: 86400 }),
-      editMessage(env, stored.job.chatId, stored.job.statusMessageId, "🚀 <b>Запускаю рендер…</b>"),
+      editMessage(env, stored.job.chatId, stored.job.statusMessageId, "🚀 <b>Запускаю рендер…</b>").catch(() => {}),
     ]);
     try { await dispatchGitHubRender(env, jobId, stored.token, Boolean(stored.job.priority)); slots--; }
     catch (error) { await env.MEDIA.delete(renderActiveKey(jobId)); await retryOrFailRender(env, stored, `Не вдалося запустити GitHub Actions: ${String(error)}`); }
   }
+}
+async function processRenderQueue(env: Env) {
+  await migrateLegacyQueue(env); await recoverStaleRenders(env);
+  await dispatchQueuedRenders(env);
+  await updateQueuePositions(env);
 }
 async function cleanupStorage(env: Env) {
   const now = Date.now(); let cursor: string | undefined; let totalBytes = 0; let deleted = 0;
@@ -1578,11 +1705,11 @@ export default {
         return json({ ok: true });
       }
       if (action === "complete" && request.method === "POST") {
-        try { return await completeRender(env, stored, request); }
+        try { const result = await completeRender(env, stored, request); ctx.waitUntil(dispatchQueuedRenders(env).catch(() => {})); return result; }
         catch (error) { await retryOrFailRender(env, stored, String(error)); return json({ error: "completion failed" }, 500); }
       }
       if (action === "failed" && request.method === "POST") {
-        const body = await request.text(); await retryOrFailRender(env, stored, body.slice(0, 1000)); return json({ ok: true });
+        const body = await request.text(); await retryOrFailRender(env, stored, body.slice(0, 1000)); ctx.waitUntil(dispatchQueuedRenders(env).catch(() => {})); return json({ ok: true });
       }
       return json({ error: "method not allowed" }, 405);
     }

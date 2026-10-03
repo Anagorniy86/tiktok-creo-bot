@@ -12,6 +12,9 @@
   "kv_namespaces": [
     { "binding": "SESSIONS", "id": "0aab37f1e9a3431d82395880e451d17b" }
   ],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "tiktok-creo-db", "database_id": "4ddf52b6-7a30-462b-8b79-2b0f43c98254" }
+  ],
   "images": { "binding": "IMAGES" },
   "r2_buckets": [
     { "binding": "MEDIA", "bucket_name": "tiktok-creo-media" }

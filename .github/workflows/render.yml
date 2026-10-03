@@ -33,15 +33,27 @@ jobs:
         run: |
           echo "::add-mask::$JOB_TOKEN"
       - uses: actions/checkout@v4
-      - name: Install FFmpeg
+        with:
+          sparse-checkout: scripts
+          sparse-checkout-cone-mode: true
+      - name: Setup FFmpeg (cached static build)
+        id: setup_ffmpeg
+        continue-on-error: true
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          ffmpeg-version: release
+          github-token: ${{ github.token }}
+      - name: Install FFmpeg (fallback)
+        if: steps.setup_ffmpeg.outcome != 'success'
         run: |
           if ! command -v ffmpeg >/dev/null 2>&1; then
-            sudo apt-get install -y -qq ffmpeg || { sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg; }
+            sudo apt-get install -y -qq --no-install-recommends ffmpeg || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg; }
           fi
-          ffmpeg -version | head -n 1
+      - name: FFmpeg version
+        run: ffmpeg -version | head -n 1
       - name: Download job
         run: |
-          curl --fail --silent --show-error --retry 3 -H "X-Render-Token: $JOB_TOKEN" "$WORKER_URL/github/render/$JOB_ID/job" -o job.json
+          curl --fail --silent --show-error --retry 3 --compressed -H "X-Render-Token: $JOB_TOKEN" "$WORKER_URL/github/render/$JOB_ID/job" -o job.json
       - name: Render video
         run: |
           node scripts/render-action.mjs job.json output.mp4 "$WORKER_URL" "$JOB_ID" "$JOB_TOKEN"

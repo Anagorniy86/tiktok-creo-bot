@@ -72,7 +72,7 @@ interface TelegramUpdate {
     photo?: Array<{ file_id: string; file_size?: number }>;
     document?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
     media_group_id?: string;
-    successful_payment?: { invoice_payload: string; currency: string; total_amount: number };
+    successful_payment?: { invoice_payload: string; currency: string; total_amount: number; is_recurring?: boolean; is_first_recurring?: boolean };
   };
   pre_checkout_query?: { id: string; from: TgUser; invoice_payload: string; currency: string; total_amount: number };
   callback_query?: {
@@ -136,6 +136,7 @@ async function getLanguage(env: Env, userId: number): Promise<Language> {
 }
 
 const RU_REPLACEMENTS: Array<[string, string]> = [
+  ["Підписка Plus — +3 відео щодня за 50 ⭐ на місяць.", "Подписка Plus — +3 видео ежедневно за 50 ⭐ в месяц."],
   ["Надішли промокод одним повідомленням", "Отправь промокод одним сообщением"],
   ["Підписка Plus — 50 Stars/міс (≈1$): +3 відео на день і пріоритетна черга.", "Подписка Plus — 50 Stars/мес (≈1$): +3 видео в день и приоритетная очередь."],
   ["Підписка Plus активна", "Подписка Plus активна"], ["+3 відео на день і пріоритетна черга", "+3 видео в день и приоритетная очередь"],
@@ -287,6 +288,7 @@ const RU_REPLACEMENTS: Array<[string, string]> = [
 ];
 
 const EN_REPLACEMENTS: Array<[string, string]> = [
+  ["Підписка Plus — +3 відео щодня за 50 ⭐ на місяць.", "Plus subscription — +3 videos daily for 50 ⭐ per month."],
   ["Надішли промокод одним повідомленням", "Send the promo code in one message"],
   ["Підписка Plus — 50 Stars/міс (≈1$): +3 відео на день і пріоритетна черга.", "Plus subscription — 50 Stars/month (≈$1): +3 videos per day and priority queue."],
   ["Підписка Plus до", "Plus subscription until"],
@@ -354,7 +356,7 @@ const EN_REPLACEMENTS: Array<[string, string]> = [
   ["Не вдалося обробити фото. Спробуй інше фото або пізніше", "Could not process the photo. Try another photo or later"],
   ["Це не схоже на фото", "This does not look like a photo"], ["Можеш надіслати ще фото", "You can send more photos"],
   ["Оригінал вже видалено. Надішли фото ще раз", "The original was deleted. Send the photo again"],
-  ["Мова", "Language"], ["сек", "sec"], ["🏠 Меню", "🏠 Menu"],
+  ["Мова", "Language"], ["сек", "sec"], ["🏠 Меню", "🏠 Menu"], ["🎟 Промокод", "🎟 Promo code"],
 ];
 
 function localizeText(text: string, language: Language) {
@@ -484,6 +486,11 @@ const batchCountKeyboard = { inline_keyboard: [
   [5, 6].map((n) => ({ text: `${n} відео`, callback_data: `batch_count:${n}` })),
   [{ text: "⬅️ Головне меню", callback_data: "main_menu" }],
 ] };
+const limitReachedKeyboard = { inline_keyboard: [
+  [{ text: "💎 Купити ліміти", callback_data: "buy_premium" }],
+  [{ text: "🎟 Промокод", callback_data: "promo" }, { text: "🎁 Реферальна програма", callback_data: "referral" }],
+  [{ text: "🏠 Меню", callback_data: "main_menu" }],
+] };
 const photosKeyboard = { inline_keyboard: [
   [{ text: "✅ Далі", callback_data: "photos_done" }],
   [{ text: "🗑 Почати заново", callback_data: "photos_restart" }],
@@ -553,7 +560,8 @@ const adminKeyboard = { inline_keyboard: [
   [{ text: "🔧 Технічні роботи", callback_data: "admin:maintenance" }],
   [{ text: "🎚 Встановити ліміт", callback_data: "admin:limit" }, { text: "♻️ Скинути ліміт", callback_data: "admin:reset_limit" }],
   [{ text: "🚫 Заблокувати", callback_data: "admin:block" }, { text: "✅ Розблокувати", callback_data: "admin:unblock" }],
-  [{ text: "❤️ Видати статус підтримки", callback_data: "admin:premium" }, { text: "🎟 Створити промокод", callback_data: "admin:promo" }],
+  [{ text: "💰 Продажі", callback_data: "admin:sales" }, { text: "❤️ Видати статус підтримки", callback_data: "admin:premium" }],
+  [{ text: "🎟 Створити промокод", callback_data: "admin:promo" }, { text: "📋 Промокоди", callback_data: "admin:promos" }],
   [{ text: "📣 Розсилка", callback_data: "admin:broadcast" }],
   [{ text: "⬅️ Головне меню", callback_data: "main_menu" }],
 ] };
@@ -611,7 +619,7 @@ async function grantPremium(env: Env, userId: number, days = PREMIUM_DAYS) {
   const current = await premiumUntil(env, userId);
   const base = Math.max(Date.now(), current);
   const until = base + days * 86400000;
-  await env.SESSIONS.put(`premium:${userId}`, String(until));
+  await env.SESSIONS.put(`premium:${userId}`, String(until), { metadata: { until } });
   return until;
 }
 async function addLimitBoost(env: Env, userId: number, amount: number, days: number, source: string) {
@@ -631,7 +639,7 @@ async function consumeDailyLimit(env: Env, userId: number, count = 1) {
 const leftLabel = (limit: Awaited<ReturnType<typeof checkDailyLimit>>) => String(limit.left);
 async function resetSession(env: Env, chatId: number) {
   const limit = await checkDailyLimit(env, chatId);
-  if (!limit.allowed) return sendMessage(env, chatId, "⛔ Денний ліміт вичерпано. Безкоштовно доступно <b>5 відео на день</b>.");
+  if (!limit.allowed) return sendMessage(env, chatId, "⛔ Денний ліміт вичерпано. Безкоштовно доступно <b>5 відео на день</b>.\n\n💎 Підписка Plus — +3 відео щодня за 50 ⭐ на місяць.", limitReachedKeyboard);
   await removeAllUploadImages(env, chatId);
   await putSession(env, chatId, { step: "photos", imageKeys: [] });
   await sendMessage(env, chatId, `Надішли <b>4–10 фото</b>. Коли завершиш — натисни «Далі».
@@ -639,7 +647,7 @@ async function resetSession(env: Env, chatId: number) {
 }
 async function startQuickCreation(env: Env, chatId: number) {
   const limit = await checkDailyLimit(env, chatId);
-  if (!limit.allowed) return sendMessage(env, chatId, "⛔ Денний ліміт вичерпано.");
+  if (!limit.allowed) return sendMessage(env, chatId, "⛔ Денний ліміт вичерпано.\n\n💎 Підписка Plus — +3 відео щодня за 50 ⭐ на місяць.", limitReachedKeyboard);
   const settings = await env.SESSIONS.get<SavedSettings>(lastSettingsKey(chatId), "json");
   if (!settings) return sendMessage(env, chatId, "Спочатку створи хоча б одне відео вручну. Після цього швидкий режим запам’ятає налаштування.", {
     inline_keyboard: [[{ text: "🎞 Створити перше відео", callback_data: "create" }], [{ text: "⬅️ Головне меню", callback_data: "main_menu" }]],
@@ -890,7 +898,7 @@ async function startRender(env: Env, chatId: number) {
   const minPhotos = session.batchCount ? batchCount * 4 : 4;
   if (session.imageKeys.length < minPhotos) return sendMessage(env, chatId, `Фото не знайдено. Потрібно щонайменше ${minPhotos}.`, createKeyboard);
   const limit = await checkDailyLimit(env, chatId);
-  if (limit.left < batchCount) return sendMessage(env, chatId, `⛔ Недостатньо генерацій. Потрібно <b>${batchCount}</b>, залишилося <b>${limit.left}</b>.`);
+  if (limit.left < batchCount) return sendMessage(env, chatId, `⛔ Недостатньо генерацій. Потрібно <b>${batchCount}</b>, залишилося <b>${limit.left}</b>.\n\n💎 Підписка Plus — +3 відео щодня за 50 ⭐ на місяць.`, limitReachedKeyboard);
   if (await env.SESSIONS.get(`active-job:${chatId}`)) return sendMessage(env, chatId, "У тебе вже є активна генерація.");
   const groups = session.batchCount ? splitBatchImages(session.imageKeys, batchCount) : [session.imageKeys.slice(0, 10)];
   const pending = await actualPendingJobs(env) + groups.length;
@@ -1010,7 +1018,7 @@ async function showTemplateMenu(env: Env, chatId: number, id: string) {
 async function startWithTemplate(env: Env, chatId: number, id: string) {
   const t = await env.SESSIONS.get<UserTemplate>(`user-template:${chatId}:${id}`, "json");
   if (!t) return listUserTemplates(env, chatId);
-  const limit = await checkDailyLimit(env, chatId); if (!limit.allowed) return sendMessage(env, chatId, "Денний ліміт вичерпано.");
+  const limit = await checkDailyLimit(env, chatId); if (!limit.allowed) return sendMessage(env, chatId, "⛔ Денний ліміт вичерпано.\n\n💎 Підписка Plus — +3 відео щодня за 50 ⭐ на місяць.", limitReachedKeyboard);
   await removeAllUploadImages(env, chatId);
   await putSession(env, chatId, { step: "photos", imageKeys: [], ...t.settings, transition: t.settings.transition || "cut", motion: t.settings.motion || "none", templatePreset: true });
   await sendMessage(env, chatId, `Шаблон <b>${escapeHtml(t.name)}</b> вибрано. Надішли 4–10 фото.`, photosKeyboard);
@@ -1264,6 +1272,61 @@ async function goBack(env: Env, chatId: number) {
   if (s.step === "template_name") { s.step = "confirm"; await putSession(env, chatId, s); return showConfirmation(env, chatId, s); }
 }
 
+interface SaleRecord { userId: number; stars: number; at: string; renewal: boolean }
+async function recordSale(env: Env, userId: number, stars: number, renewal: boolean) {
+  const month = kyivDate().slice(0, 7);
+  const recent = ((await env.SESSIONS.get<SaleRecord[]>("sales:recent", "json")) || []).slice(0, 19);
+  await Promise.all([
+    incMetric(env, "premium_purchases"), incMetric(env, "stars_total", stars), incMetric(env, `stars_month:${month}`, stars),
+    incDailyMetric(env, "stars", stars), incMetric(env, renewal ? "plus_renewals" : "plus_new"),
+    env.SESSIONS.put("sales:recent", JSON.stringify([{ userId, stars, at: new Date().toISOString(), renewal }, ...recent])),
+  ]);
+}
+async function countActivePlus(env: Env) {
+  let cursor: string | undefined; let active = 0; const now = Date.now();
+  do {
+    const page = await env.SESSIONS.list<{ until?: number }>({ prefix: "premium:", cursor, limit: 1000 });
+    const values = await Promise.all(page.keys.map(async (k) => k.metadata?.until ?? Number((await env.SESSIONS.get(k.name)) || 0)));
+    active += values.filter((until) => until > now).length;
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return active;
+}
+async function adminSales(env: Env, chatId: number) {
+  const month = kyivDate().slice(0, 7);
+  const [today, monthStars, total, purchases, fresh, renewals, promos, active, recent] = await Promise.all([
+    env.SESSIONS.get(`daily-metric:${kyivDate()}:stars`), metric(env, `stars_month:${month}`), metric(env, "stars_total"),
+    metric(env, "premium_purchases"), metric(env, "plus_new"), metric(env, "plus_renewals"), metric(env, "promo_redemptions"),
+    countActivePlus(env), env.SESSIONS.get<SaleRecord[]>("sales:recent", "json"),
+  ]);
+  const usd = (stars: number) => (stars * 0.013).toFixed(2);
+  const lines = (recent || []).slice(0, 10).map((r) => `• ${r.at.slice(5, 16).replace("T", " ")} — <code>${r.userId}</code> ${r.stars} ⭐${r.renewal ? " 🔁" : ""}`);
+  await sendMessage(env, chatId, `<b>💰 Продажі</b>\n\nСьогодні: <b>${Number(today || 0)} ⭐</b>\nЦей місяць: <b>${monthStars} ⭐</b> (≈$${usd(monthStars)} на вивід)\nУсього: <b>${total} ⭐</b> (≈$${usd(total)})\n\nПокупок усього: <b>${purchases}</b>\nНових Plus: <b>${fresh}</b> · Продовжень: <b>${renewals}</b>\nАктивних Plus зараз: <b>${active}</b>\nАктивацій промокодів: <b>${promos}</b>\n\n<b>Останні покупки</b>\n${lines.join("\n") || "Ще немає."}\n\n<i>Рахуються покупки з ${"03.10.2026"}. ⭐ ≈ $0.013 при виводі.</i>`,
+    { inline_keyboard: [[{ text: "🔄 Оновити", callback_data: "admin:sales" }], [{ text: "⬅️ В адмін-панель", callback_data: "admin:home" }]] });
+}
+// --- 10. promo list
+async function adminPromoList(env: Env, chatId: number) {
+  const page = await env.SESSIONS.list({ prefix: "promo:", limit: 200 });
+  const promos = (await Promise.all(page.keys.map((k) => env.SESSIONS.get<PromoCode>(k.name, "json")))).filter((p): p is PromoCode => Boolean(p));
+  promos.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || "") || a.code.localeCompare(b.code));
+  const shown = promos.slice(0, 30);
+  const describe = (p: PromoCode) => p.type === "premium"
+    ? `💎 Plus ${p.days || p.value} дн.`
+    : `🎬 +${p.value}/день · ${p.days || 30} дн.`;
+  const lines = shown.map((p) => `${p.usedBy.length >= p.maxUses ? "⚪️" : "🟢"} <code>${p.code}</code> — ${describe(p)} · <b>${p.usedBy.length}/${p.maxUses}</b>`);
+  const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+  for (let i = 0; i < shown.length; i += 2) rows.push(shown.slice(i, i + 2).map((p) => ({ text: `🗑 ${p.code}`, callback_data: `admin:promo_del:${p.code}` })));
+  rows.push([{ text: "🎟 Створити промокод", callback_data: "admin:promo" }], [{ text: "⬅️ В адмін-панель", callback_data: "admin:home" }]);
+  await sendMessage(env, chatId, `<b>📋 Промокоди</b> (${promos.length})\n🟢 активний · ⚪️ вичерпано · <b>використано/ліміт</b>\n\n${lines.join("\n") || "Промокодів ще немає."}${promos.length > shown.length ? `\n\n…і ще ${promos.length - shown.length}` : ""}`, { inline_keyboard: rows });
+}
+async function adminPromoDelete(env: Env, chatId: number, code: string, confirmed: boolean) {
+  const promo = await env.SESSIONS.get<PromoCode>(`promo:${code}`, "json");
+  if (!promo) return sendMessage(env, chatId, "Промокод не знайдено.", { inline_keyboard: [[{ text: "📋 Промокоди", callback_data: "admin:promos" }]] });
+  if (!confirmed) return sendMessage(env, chatId, `Видалити промокод <code>${code}</code>? Використано: <b>${promo.usedBy.length}/${promo.maxUses}</b>.\nВже видані бонуси залишаться у користувачів.`, { inline_keyboard: [[{ text: "🗑 Так, видалити", callback_data: `admin:promo_delok:${code}` }], [{ text: "⬅️ Ні", callback_data: "admin:promos" }]] });
+  await env.SESSIONS.delete(`promo:${code}`);
+  await sendMessage(env, chatId, `✅ Промокод <code>${code}</code> видалено.`);
+  return adminPromoList(env, chatId);
+}
 async function adminStats(env: Env, chatId: number) {
   const names = ["total_users", "total_jobs", "completed", "failed", "rendered_seconds", "blocked"];
   const [users, jobs, completed, failed, seconds, blocked] = await Promise.all(names.map((n) => metric(env, n)));
@@ -1434,6 +1497,10 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
       if (data === "admin:broadcast") return promptAdmin(env, chatId, "broadcast");
       if (data === "admin:premium") return promptAdmin(env, chatId, "premium");
       if (data === "admin:promo") return showPromoTypeMenu(env, chatId);
+      if (data === "admin:sales") return adminSales(env, chatId);
+      if (data === "admin:promos") return adminPromoList(env, chatId);
+      if (data.startsWith("admin:promo_del:")) return adminPromoDelete(env, chatId, data.slice("admin:promo_del:".length), false);
+      if (data.startsWith("admin:promo_delok:")) return adminPromoDelete(env, chatId, data.slice("admin:promo_delok:".length), true);
       if (data === "admin:promo_type:premium" || data === "admin:promo_type:videos") return startPromoWizard(env, chatId, data.endsWith("premium") ? "premium" : "videos");
     }
     if (data === "language_menu") return sendMessage(env, chatId, "<b>Оберіть мову / Выберите язык / Choose language</b>", languageKeyboard);
@@ -1498,7 +1565,8 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
   const paidPlus = paid?.currency === "XTR" && paid.invoice_payload === `plus30:${userId}` && paid.total_amount === PREMIUM_STARS;
   const paidLegacy = paid?.currency === "XTR" && [`support30:${userId}`, `premium30:${userId}`].includes(paid.invoice_payload) && paid.total_amount === LEGACY_SUPPORT_STARS;
   if (paidPlus || paidLegacy) {
-    const until = await grantPremium(env, userId, PREMIUM_DAYS); await incMetric(env, "premium_purchases");
+    const until = await grantPremium(env, userId, PREMIUM_DAYS);
+    await recordSale(env, userId, paid!.total_amount, Boolean(paid!.is_recurring && !paid!.is_first_recurring));
     return sendMessage(env, chatId, `💎 Підписка Plus активна! Дякую за підтримку ❤️ До <b>${new Date(until).toLocaleDateString("uk-UA", { timeZone: "Europe/Kyiv" })}</b> доступно +3 відео на день і пріоритетна черга.`, createKeyboard);
   }
   if (message.text && await handleAdminCommand(env, chatId, userId, message.text)) return;

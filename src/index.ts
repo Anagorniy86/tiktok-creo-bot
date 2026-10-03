@@ -101,9 +101,10 @@ const kyivDate = () => new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Kyiv
 const dailyKey = (userId: number) => `daily:${userId}:${kyivDate()}`;
 const lastSettingsKey = (userId: number) => `last-settings:${userId}`;
 const DAILY_LIMIT = 5;
-const PREMIUM_STARS = 100;
+const PREMIUM_STARS = 50; // ≈ $1 Plus subscription (30 days, auto-renew)
+const LEGACY_SUPPORT_STARS = 100;
 const PREMIUM_DAYS = 30;
-const SUPPORTER_DAILY_BONUS = 2;
+const SUPPORTER_DAILY_BONUS = 3;
 const BOT_USERNAME = "avto_creo_bot";
 const RATE_LIMIT_PER_MINUTE = 60;
 const OUTPUT_TTL_MS = 60 * 60 * 1000;
@@ -133,6 +134,10 @@ async function getLanguage(env: Env, userId: number): Promise<Language> {
 }
 
 const RU_REPLACEMENTS: Array<[string, string]> = [
+  ["Підписка Plus — 50 Stars/міс (≈1$): +3 відео на день і пріоритетна черга.", "Подписка Plus — 50 Stars/мес (≈1$): +3 видео в день и приоритетная очередь."],
+  ["Підписка Plus активна", "Подписка Plus активна"], ["+3 відео на день і пріоритетна черга", "+3 видео в день и приоритетная очередь"],
+  ["Купити ліміти", "Купить лимиты"], ["Підписка Plus", "Подписка Plus"],
+  ["доступно +3 відео на день", "доступно +3 видео в день"], ["+3 відео на день", "+3 видео в день"],
   ["Створити декілька відео", "Создать несколько видео"],
   ["Створити одне відео", "Создать одно видео"],
   ["Реферальна програма", "Реферальная программа"],
@@ -279,6 +284,11 @@ const RU_REPLACEMENTS: Array<[string, string]> = [
 ];
 
 const EN_REPLACEMENTS: Array<[string, string]> = [
+  ["Підписка Plus — 50 Stars/міс (≈1$): +3 відео на день і пріоритетна черга.", "Plus subscription — 50 Stars/month (≈$1): +3 videos per day and priority queue."],
+  ["Підписка Plus до", "Plus subscription until"],
+  ["Підписка Plus активна", "Plus subscription is active"], ["доступно +3 відео на день і пріоритетна черга", "+3 videos per day and priority queue are available"], ["+3 відео на день і пріоритетна черга", "+3 videos per day and priority queue"], ["До <b>", "Until <b>"],
+  ["Купити ліміти", "Buy limits"], ["Підписка Plus", "Plus subscription"],
+  ["доступно +3 відео на день", "+3 videos per day are available"], ["+3 відео на день", "+3 videos per day"],
   ["Створити декілька відео", "Create multiple videos"], ["Створити одне відео", "Create one video"],
   ["Реферальна програма", "Referral program"], ["Видалити мої дані", "Delete my data"],
   ["Зберегти як мій шаблон", "Save as my template"], ["Повідомити про проблему", "Report a problem"],
@@ -452,7 +462,7 @@ const createKeyboard = { inline_keyboard: [
   [{ text: "⚡ Швидке створення", callback_data: "quick_create" }],
   [{ text: "🪄 Унікалізація фото", callback_data: "uniq" }],
   [{ text: "🎬 Створити декілька відео", callback_data: "batch_create" }],
-  [{ text: "❤️ Подякувати автору — 100 Stars", callback_data: "buy_premium" }],
+  [{ text: "💎 Купити ліміти", callback_data: "buy_premium" }],
   [{ text: "🎁 Реферальна програма", callback_data: "referral" }, { text: "🎟 Промокод", callback_data: "promo" }],
   [{ text: "📁 Мої шаблони", callback_data: "my_templates" }],
   [{ text: "👤 Мій профіль", callback_data: "profile" }, { text: "ℹ️ Допомога", callback_data: "help" }],
@@ -1059,30 +1069,36 @@ async function showReferral(env: Env, chatId: number) {
 }
 async function buyPremium(env: Env, chatId: number) {
   const language = await getLanguage(env, chatId);
+  const limit = await checkDailyLimit(env, chatId);
   const copy = {
-    ru: {
-      title: "Поддержать автора",
-      description: "Разовая благодарность автору. На 30 дней: +2 видео в день и приоритетная очередь.",
-      label: "Спасибо автору",
-    },
     uk: {
-      title: "Подякувати автору",
-      description: "Разова подяка автору. На 30 днів: +2 відео на день і пріоритетна черга.",
-      label: "Подяка автору",
+      title: "Підписка Plus", label: "Plus на 30 днів",
+      description: "Підтримка автора + 3 відео на день і пріоритетна черга. Продовжується щомісяця, скасувати можна будь-коли в Telegram.",
+      text: (until: string) => `<b>💎 Купити ліміти</b>\n\n<b>Підписка Plus — ${PREMIUM_STARS} ⭐ на місяць (≈1$)</b>\n• +${SUPPORTER_DAILY_BONUS} відео щодня: <b>${DAILY_LIMIT + SUPPORTER_DAILY_BONUS}</b> замість ${DAILY_LIMIT}\n• пріоритетна черга — відео робляться першими\n• підтримка розвитку бота ❤️\n\nОплата через Telegram Stars, автопродовження раз на 30 днів. Скасувати можна будь-коли: Налаштування Telegram → Мої зірки → Підписки.${until}`,
+      active: (d: string) => `\n\n✅ Зараз активна до <b>${d}</b>.`, button: `⭐ Оформити за ${PREMIUM_STARS} Stars`, back: "⬅️ Головне меню",
+    },
+    ru: {
+      title: "Подписка Plus", label: "Plus на 30 дней",
+      description: "Поддержка автора + 3 видео в день и приоритетная очередь. Продлевается ежемесячно, отменить можно в любой момент в Telegram.",
+      text: (until: string) => `<b>💎 Купить лимиты</b>\n\n<b>Подписка Plus — ${PREMIUM_STARS} ⭐ в месяц (≈1$)</b>\n• +${SUPPORTER_DAILY_BONUS} видео ежедневно: <b>${DAILY_LIMIT + SUPPORTER_DAILY_BONUS}</b> вместо ${DAILY_LIMIT}\n• приоритетная очередь — видео делаются первыми\n• поддержка развития бота ❤️\n\nОплата через Telegram Stars, автопродление раз в 30 дней. Отменить можно в любой момент: Настройки Telegram → Мои звёзды → Подписки.${until}`,
+      active: (d: string) => `\n\n✅ Сейчас активна до <b>${d}</b>.`, button: `⭐ Оформить за ${PREMIUM_STARS} Stars`, back: "⬅️ Главное меню",
     },
     en: {
-      title: "Support the creator",
-      description: "A one-time thank you. For 30 days: +2 videos per day and priority queue.",
-      label: "Thank the creator",
+      title: "Plus subscription", label: "Plus for 30 days",
+      description: "Support the creator + 3 videos per day and priority queue. Renews monthly, cancel anytime in Telegram.",
+      text: (until: string) => `<b>💎 Buy limits</b>\n\n<b>Plus subscription — ${PREMIUM_STARS} ⭐ per month (≈$1)</b>\n• +${SUPPORTER_DAILY_BONUS} videos daily: <b>${DAILY_LIMIT + SUPPORTER_DAILY_BONUS}</b> instead of ${DAILY_LIMIT}\n• priority queue — your videos go first\n• supports the bot's development ❤️\n\nPaid with Telegram Stars, renews every 30 days. Cancel anytime: Telegram Settings → My Stars → Subscriptions.${until}`,
+      active: (d: string) => `\n\n✅ Active until <b>${d}</b>.`, button: `⭐ Subscribe for ${PREMIUM_STARS} Stars`, back: "⬅️ Main menu",
     },
   }[language];
-  await telegram(env, "sendInvoice", {
-    chat_id: chatId,
-    title: copy.title,
-    description: copy.description,
-    payload: `support30:${chatId}`,
-    currency: "XTR",
-    prices: [{ label: copy.label, amount: PREMIUM_STARS }],
+  const invoice = { title: copy.title, description: copy.description, payload: `plus30:${chatId}`, currency: "XTR", prices: [{ label: copy.label, amount: PREMIUM_STARS }] };
+  // Prefer an auto-renewing Stars subscription; fall back to a one-time 30-day payment if Telegram rejects it.
+  const link = await telegram(env, "createInvoiceLink", { ...invoice, subscription_period: 30 * 86400 })
+    .catch(async (error) => { await recordError(env, "plus_subscription_link", error); return telegram(env, "createInvoiceLink", invoice); }) as string;
+  const locale = language === "en" ? "en-GB" : language === "ru" ? "ru-RU" : "uk-UA";
+  const until = limit.premiumUntil ? copy.active(new Date(limit.premiumUntil).toLocaleDateString(locale, { timeZone: "Europe/Kyiv" })) : "";
+  await telegram(env, "sendMessage", {
+    chat_id: chatId, text: copy.text(until), parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [[{ text: copy.button, url: link }], [{ text: copy.back, callback_data: "main_menu" }]] },
   });
 }
 async function askPromo(env: Env, chatId: number) {
@@ -1100,7 +1116,7 @@ async function redeemPromo(env: Env, userId: number, rawCode: string) {
   if (promo.type === "premium") await grantPremium(env, userId, promo.value);
   else await addLimitBoost(env, userId, promo.value, 30, `promo:${code}`);
   await Promise.all([env.SESSIONS.put(key, JSON.stringify(promo)), env.SESSIONS.delete(sessionKey(userId)), incMetric(env, "promo_redemptions")]);
-  await sendMessage(env, userId, promo.type === "premium" ? `✅ Активовано статус підтримки на <b>${promo.value} днів</b>: +2 відео на день і пріоритетна черга.` : `✅ Денний ліміт збільшено на <b>+${promo.value}</b> протягом 30 днів.`, createKeyboard);
+  await sendMessage(env, userId, promo.type === "premium" ? `✅ Активовано статус підтримки на <b>${promo.value} днів</b>: +3 відео на день і пріоритетна черга.` : `✅ Денний ліміт збільшено на <b>+${promo.value}</b> протягом 30 днів.`, createKeyboard);
 }
 async function askFeedback(env: Env, chatId: number, jobId: string) {
   await putSession(env, chatId, { step: "feedback_input", imageKeys: [], feedbackJobId: jobId });
@@ -1115,13 +1131,13 @@ async function saveFeedback(env: Env, chatId: number, session: Session, text: st
 async function showProfile(env: Env, chatId: number) {
   const limit = await checkDailyLimit(env, chatId);
   const ids = ((await env.SESSIONS.get(`user-templates:${chatId}:index`, "json")) as string[] | null) || [];
-  const status = `${limit.premiumUntil ? `❤️ Підтримка автора до ${new Date(limit.premiumUntil).toLocaleDateString("uk-UA", { timeZone: "Europe/Kyiv" })}\n` : ""}Залишилося сьогодні: <b>${limit.left}/${limit.limit}</b>`;
+  const status = `${limit.premiumUntil ? `💎 Підписка Plus до ${new Date(limit.premiumUntil).toLocaleDateString("uk-UA", { timeZone: "Europe/Kyiv" })}\n` : ""}Залишилося сьогодні: <b>${limit.left}/${limit.limit}</b>`;
   await sendMessage(env, chatId, `<b>👤 Мій профіль</b>\n\nTelegram ID: <code>${chatId}</code>\n${status}\nПриватних шаблонів: <b>${ids.length}/20</b>\nWatermark: <b>немає</b>`, {
-    inline_keyboard: [[{ text: "❤️ Подякувати автору", callback_data: "buy_premium" }],[{ text: "🎁 Реферальна програма", callback_data: "referral" }, { text: "🎟 Промокод", callback_data: "promo" }],[{ text: "📁 Мої шаблони", callback_data: "my_templates" }],[{ text: "🗑 Видалити мої дані", callback_data: "delete_my_data" }],[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]],
+    inline_keyboard: [[{ text: "💎 Купити ліміти", callback_data: "buy_premium" }],[{ text: "🎁 Реферальна програма", callback_data: "referral" }, { text: "🎟 Промокод", callback_data: "promo" }],[{ text: "📁 Мої шаблони", callback_data: "my_templates" }],[{ text: "🗑 Видалити мої дані", callback_data: "delete_my_data" }],[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]],
   });
 }
 async function showHelp(env: Env, chatId: number) {
-  await sendMessage(env, chatId, "<b>ℹ️ Допомога</b>\n\n• Одне відео: завантаж 4–10 фото.\n• Декілька відео: обери 3–6 та завантаж 4–5 фото на кожне.\n• Безкоштовно: 5 відео на день.\n• Подяка автору — 100 Stars: до 7 відео на день і пріоритетна черга протягом 30 днів.\n\nУсі функції доступні кнопками.", { inline_keyboard: [[{ text: "🎞 Створити", callback_data: "create" }, { text: "🎬 Декілька", callback_data: "batch_create" }],[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]] });
+  await sendMessage(env, chatId, "<b>ℹ️ Допомога</b>\n\n• Одне відео: завантаж 4–10 фото.\n• Декілька відео: обери 3–6 та завантаж 4–5 фото на кожне.\n• Безкоштовно: 5 відео на день.\n• Підписка Plus — 50 Stars/міс (≈1$): +3 відео на день і пріоритетна черга.\n\nУсі функції доступні кнопками.", { inline_keyboard: [[{ text: "🎞 Створити", callback_data: "create" }, { text: "🎬 Декілька", callback_data: "batch_create" }],[{ text: "⬅️ Головне меню", callback_data: "main_menu" }]] });
 }
 async function promptAdmin(env: Env, chatId: number, action: Session["adminAction"]) {
   await putSession(env, chatId, { step: "admin_input", imageKeys: [], adminAction: action });
@@ -1312,8 +1328,9 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
   await registerUser(env, user);
   if (checkout) {
     const language = await getLanguage(env, checkout.from.id);
-    const validPayload = checkout.invoice_payload === `support30:${checkout.from.id}` || checkout.invoice_payload === `premium30:${checkout.from.id}`;
-    const valid = checkout.currency === "XTR" && checkout.total_amount === PREMIUM_STARS && validPayload;
+    const plus = checkout.invoice_payload === `plus30:${checkout.from.id}` && checkout.total_amount === PREMIUM_STARS;
+    const legacy = [`support30:${checkout.from.id}`, `premium30:${checkout.from.id}`].includes(checkout.invoice_payload) && checkout.total_amount === LEGACY_SUPPORT_STARS;
+    const valid = checkout.currency === "XTR" && (plus || legacy);
     const paymentError = language === "ru" ? "Неверные параметры платежа." : language === "en" ? "Invalid payment parameters." : "Неправильні параметри платежу.";
     await telegram(env, "answerPreCheckoutQuery", { pre_checkout_query_id: checkout.id, ok: valid, ...(valid ? {} : { error_message: paymentError }) });
     return;
@@ -1405,9 +1422,12 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
   }
   const message = update.message; if (!message) return;
   const chatId = message.chat.id; const userId = message.from?.id || chatId;
-  if ([`support30:${userId}`, `premium30:${userId}`].includes(message.successful_payment?.invoice_payload || "") && message.successful_payment?.currency === "XTR" && message.successful_payment.total_amount === PREMIUM_STARS) {
+  const paid = message.successful_payment;
+  const paidPlus = paid?.currency === "XTR" && paid.invoice_payload === `plus30:${userId}` && paid.total_amount === PREMIUM_STARS;
+  const paidLegacy = paid?.currency === "XTR" && [`support30:${userId}`, `premium30:${userId}`].includes(paid.invoice_payload) && paid.total_amount === LEGACY_SUPPORT_STARS;
+  if (paidPlus || paidLegacy) {
     const until = await grantPremium(env, userId, PREMIUM_DAYS); await incMetric(env, "premium_purchases");
-    return sendMessage(env, chatId, `❤️ Дякую за підтримку! До <b>${new Date(until).toLocaleDateString("uk-UA", { timeZone: "Europe/Kyiv" })}</b> доступно +2 відео на день і пріоритетна черга.`, createKeyboard);
+    return sendMessage(env, chatId, `💎 Підписка Plus активна! Дякую за підтримку ❤️ До <b>${new Date(until).toLocaleDateString("uk-UA", { timeZone: "Europe/Kyiv" })}</b> доступно +3 відео на день і пріоритетна черга.`, createKeyboard);
   }
   if (message.text && await handleAdminCommand(env, chatId, userId, message.text)) return;
   if (message.text?.startsWith("/start")) {

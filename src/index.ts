@@ -38,7 +38,8 @@ interface Session {
   batchCount?: number;
   actionTemplateId?: string;
   feedbackJobId?: string;
-  adminAction?: "limit" | "reset_limit" | "block" | "unblock" | "broadcast" | "premium" | "promo" | "user_search";
+  adminAction?: "limit" | "reset_limit" | "block" | "unblock" | "broadcast" | "premium" | "promo" | "promo_wizard" | "user_search";
+  promoDraft?: PromoDraft;
 }
 interface RenderJob {
   jobId: string;
@@ -88,7 +89,8 @@ interface SavedSettings {
 }
 interface UserTemplate { id: string; ownerId: number; name: string; settings: SavedSettings; createdAt: string }
 interface LimitBoost { amount: number; expiresAt: number; source: string }
-interface PromoCode { code: string; type: "videos" | "premium"; value: number; maxUses: number; usedBy: number[] }
+interface PromoCode { code: string; type: "videos" | "premium"; value: number; maxUses: number; usedBy: number[]; days?: number; createdAt?: string }
+interface PromoDraft { type: "videos" | "premium"; stage: "name" | "days" | "videos" | "uses"; code?: string; days?: number; videos?: number }
 
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), {
   status,
@@ -134,6 +136,7 @@ async function getLanguage(env: Env, userId: number): Promise<Language> {
 }
 
 const RU_REPLACEMENTS: Array<[string, string]> = [
+  ["Надішли промокод одним повідомленням", "Отправь промокод одним сообщением"],
   ["Підписка Plus — 50 Stars/міс (≈1$): +3 відео на день і пріоритетна черга.", "Подписка Plus — 50 Stars/мес (≈1$): +3 видео в день и приоритетная очередь."],
   ["Підписка Plus активна", "Подписка Plus активна"], ["+3 відео на день і пріоритетна черга", "+3 видео в день и приоритетная очередь"],
   ["Купити ліміти", "Купить лимиты"], ["Підписка Plus", "Подписка Plus"],
@@ -284,6 +287,7 @@ const RU_REPLACEMENTS: Array<[string, string]> = [
 ];
 
 const EN_REPLACEMENTS: Array<[string, string]> = [
+  ["Надішли промокод одним повідомленням", "Send the promo code in one message"],
   ["Підписка Plus — 50 Stars/міс (≈1$): +3 відео на день і пріоритетна черга.", "Plus subscription — 50 Stars/month (≈$1): +3 videos per day and priority queue."],
   ["Підписка Plus до", "Plus subscription until"],
   ["Підписка Plus активна", "Plus subscription is active"], ["доступно +3 відео на день і пріоритетна черга", "+3 videos per day and priority queue are available"], ["+3 відео на день і пріоритетна черга", "+3 videos per day and priority queue"], ["До <b>", "Until <b>"],
@@ -1104,20 +1108,35 @@ async function buyPremium(env: Env, chatId: number) {
 }
 async function askPromo(env: Env, chatId: number) {
   await putSession(env, chatId, { step: "promo_input", imageKeys: [] });
-  await sendMessage(env, chatId, "Надішли промокод одним повідомленням:");
+  await sendMessage(env, chatId, "🎟 Надішли промокод одним повідомленням:", { inline_keyboard: [[{ text: "🏠 Меню", callback_data: "main_menu" }]] });
 }
 async function redeemPromo(env: Env, userId: number, rawCode: string) {
+  const language = await getLanguage(env, userId);
+  const t = {
+    uk: { notFound: "❌ Промокод не знайдено.", used: "Цей промокод уже активовано тобою.", over: "Ліміт активацій цього промокоду вичерпано.",
+      premium: (d: number) => `✅ Промокод активовано! <b>Підписка Plus на ${d} дн.</b>: +${SUPPORTER_DAILY_BONUS} відео на день і пріоритетна черга.`,
+      videos: (v: number, d: number) => `✅ Промокод активовано! <b>+${v} відео на день</b> протягом <b>${d} дн.</b>` },
+    ru: { notFound: "❌ Промокод не найден.", used: "Этот промокод уже активирован тобой.", over: "Лимит активаций этого промокода исчерпан.",
+      premium: (d: number) => `✅ Промокод активирован! <b>Подписка Plus на ${d} дн.</b>: +${SUPPORTER_DAILY_BONUS} видео в день и приоритетная очередь.`,
+      videos: (v: number, d: number) => `✅ Промокод активирован! <b>+${v} видео в день</b> в течение <b>${d} дн.</b>` },
+    en: { notFound: "❌ Promo code not found.", used: "You have already activated this promo code.", over: "This promo code has reached its activation limit.",
+      premium: (d: number) => `✅ Promo code activated! <b>Plus subscription for ${d} days</b>: +${SUPPORTER_DAILY_BONUS} videos per day and priority queue.`,
+      videos: (v: number, d: number) => `✅ Promo code activated! <b>+${v} videos per day</b> for <b>${d} days</b>.` },
+  }[language];
+  const reply = (text: string) => telegram(env, "sendMessage", { chat_id: userId, text, parse_mode: "HTML", reply_markup: localizeMarkup(createKeyboard, language) });
   const code = rawCode.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, "");
   const key = `promo:${code}`;
   const promo = await env.SESSIONS.get<PromoCode>(key, "json");
-  if (!promo) return sendMessage(env, userId, "❌ Промокод не знайдено.", createKeyboard);
-  if (promo.usedBy.includes(userId)) return sendMessage(env, userId, "Цей промокод уже активовано тобою.", createKeyboard);
-  if (promo.usedBy.length >= promo.maxUses) return sendMessage(env, userId, "Термін використання промокоду завершено.", createKeyboard);
+  await env.SESSIONS.delete(sessionKey(userId));
+  if (!promo) return reply(t.notFound);
+  if (promo.usedBy.includes(userId)) return reply(t.used);
+  if (promo.usedBy.length >= promo.maxUses) return reply(t.over);
   promo.usedBy.push(userId);
-  if (promo.type === "premium") await grantPremium(env, userId, promo.value);
-  else await addLimitBoost(env, userId, promo.value, 30, `promo:${code}`);
-  await Promise.all([env.SESSIONS.put(key, JSON.stringify(promo)), env.SESSIONS.delete(sessionKey(userId)), incMetric(env, "promo_redemptions")]);
-  await sendMessage(env, userId, promo.type === "premium" ? `✅ Активовано статус підтримки на <b>${promo.value} днів</b>: +3 відео на день і пріоритетна черга.` : `✅ Денний ліміт збільшено на <b>+${promo.value}</b> протягом 30 днів.`, createKeyboard);
+  const days = promo.days || (promo.type === "premium" ? promo.value : 30);
+  if (promo.type === "premium") await grantPremium(env, userId, days);
+  else await addLimitBoost(env, userId, promo.value, days, `promo:${code}`);
+  await Promise.all([env.SESSIONS.put(key, JSON.stringify(promo)), incMetric(env, "promo_redemptions")]);
+  await reply(promo.type === "premium" ? t.premium(days) : t.videos(promo.value, days));
 }
 async function askFeedback(env: Env, chatId: number, jobId: string) {
   await putSession(env, chatId, { step: "feedback_input", imageKeys: [], feedbackJobId: jobId });
@@ -1152,10 +1171,61 @@ async function promptAdmin(env: Env, chatId: number, action: Session["adminActio
     promo: "Надішли: <code>КОД ТИП ЗНАЧЕННЯ ВИКОРИСТАНЬ</code>\nТипи: <code>PREMIUM</code> (дні) або <code>VIDEOS</code> (+відео щодня на 30 днів).\nПриклад: <code>SALE PREMIUM 30 100</code>",
     user_search: "Надішли Telegram ID, @username або ім’я користувача:",
   };
-  await sendMessage(env, chatId, prompts[action!], { inline_keyboard: [[{ text: "⬅️ В адмін-панель", callback_data: "admin:home" }]] });
+  await sendMessage(env, chatId, prompts[action as keyof typeof prompts], { inline_keyboard: [[{ text: "⬅️ В адмін-панель", callback_data: "admin:home" }]] });
+}
+const promoBackKeyboard = { inline_keyboard: [[{ text: "❌ Скасувати", callback_data: "admin:promo" }], [{ text: "⬅️ В адмін-панель", callback_data: "admin:home" }]] };
+async function showPromoTypeMenu(env: Env, chatId: number) {
+  await env.SESSIONS.delete(sessionKey(chatId));
+  await sendMessage(env, chatId, "<b>🎟 Новий промокод</b>\n\nЩо дає промокод?", { inline_keyboard: [
+    [{ text: "💎 Преміум (Plus)", callback_data: "admin:promo_type:premium" }],
+    [{ text: "🎬 Ліміти відео", callback_data: "admin:promo_type:videos" }],
+    [{ text: "⬅️ В адмін-панель", callback_data: "admin:home" }],
+  ] });
+}
+async function startPromoWizard(env: Env, chatId: number, type: PromoDraft["type"]) {
+  await putSession(env, chatId, { step: "admin_input", imageKeys: [], adminAction: "promo_wizard", promoDraft: { type, stage: "name" } });
+  const title = type === "premium" ? "💎 Промокод на преміум" : "🎬 Промокод на ліміти відео";
+  await sendMessage(env, chatId, `<b>${title}</b>\n\nКрок 1/${type === "premium" ? 3 : 4}. Надішли <b>назву промокоду</b> (латиниця, цифри, _ або -), наприклад <code>SALE2026</code>.`, promoBackKeyboard);
+}
+async function handlePromoWizard(env: Env, chatId: number, session: Session, text: string) {
+  const draft = session.promoDraft!;
+  const total = draft.type === "premium" ? 3 : 4;
+  const ask = async (stepNo: number, what: string) => { await putSession(env, chatId, session); return sendMessage(env, chatId, `Крок ${stepNo}/${total}. ${what}`, promoBackKeyboard); };
+  const number = Math.floor(Number(text.trim().replace(",", ".")));
+  if (draft.stage === "name") {
+    const code = text.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, "");
+    if (code.length < 3 || code.length > 32) return sendMessage(env, chatId, "❌ Назва має бути 3–32 символи: латиниця, цифри, _ або -. Спробуй ще раз.", promoBackKeyboard);
+    if (await env.SESSIONS.get(`promo:${code}`)) return sendMessage(env, chatId, `❌ Промокод <code>${code}</code> вже існує. Надішли іншу назву.`, promoBackKeyboard);
+    draft.code = code; draft.stage = "days";
+    return ask(2, draft.type === "premium" ? "На <b>скільки днів</b> дається преміум? (1–365)" : "<b>Скільки днів</b> діятиме бонус до лімітів? (1–365)");
+  }
+  if (draft.stage === "days") {
+    if (!Number.isFinite(number) || number < 1 || number > 365) return sendMessage(env, chatId, "❌ Введи число від 1 до 365.", promoBackKeyboard);
+    draft.days = number;
+    if (draft.type === "videos") { draft.stage = "videos"; return ask(3, "<b>Скільки додаткових відео на день</b> дає промокод? (1–100)"); }
+    draft.stage = "uses"; return ask(3, "<b>Скільки людей</b> можуть активувати промокод? (1–100000)");
+  }
+  if (draft.stage === "videos") {
+    if (!Number.isFinite(number) || number < 1 || number > 100) return sendMessage(env, chatId, "❌ Введи число від 1 до 100.", promoBackKeyboard);
+    draft.videos = number; draft.stage = "uses";
+    return ask(4, "<b>Скільки людей</b> можуть активувати промокод? (1–100000)");
+  }
+  if (!Number.isFinite(number) || number < 1 || number > 100000) return sendMessage(env, chatId, "❌ Введи число від 1 до 100000.", promoBackKeyboard);
+  const code = draft.code!;
+  if (await env.SESSIONS.get(`promo:${code}`)) { await env.SESSIONS.delete(sessionKey(chatId)); return sendMessage(env, chatId, `❌ Промокод <code>${code}</code> вже існує.`, adminKeyboard); }
+  const promo: PromoCode = draft.type === "premium"
+    ? { code, type: "premium", value: draft.days!, days: draft.days!, maxUses: number, usedBy: [], createdAt: new Date().toISOString() }
+    : { code, type: "videos", value: draft.videos!, days: draft.days!, maxUses: number, usedBy: [], createdAt: new Date().toISOString() };
+  await env.SESSIONS.put(`promo:${code}`, JSON.stringify(promo));
+  await env.SESSIONS.delete(sessionKey(chatId));
+  const details = draft.type === "premium"
+    ? `Тип: <b>💎 Преміум (Plus)</b>\nДнів: <b>${draft.days}</b>\nЛюдей: <b>${number}</b>`
+    : `Тип: <b>🎬 Ліміти відео</b>\nДнів: <b>${draft.days}</b>\nВідео на день: <b>+${draft.videos}</b>\nЛюдей: <b>${number}</b>`;
+  await sendMessage(env, chatId, `✅ Промокод створено\n\nКод: <code>${code}</code>\n${details}`, { inline_keyboard: [[{ text: "🎟 Створити ще", callback_data: "admin:promo" }], [{ text: "⬅️ В адмін-панель", callback_data: "admin:home" }]] });
 }
 async function handleAdminInput(env: Env, chatId: number, session: Session, text: string) {
   const action = session.adminAction;
+  if (action === "promo_wizard" && session.promoDraft) return handlePromoWizard(env, chatId, session, text);
   if (action === "limit") { const [id, limit] = text.split(/\s+/); await env.SESSIONS.put(`limit:${id}`, String(Math.max(0, Number(limit)))); await sendMessage(env, chatId, "✅ Ліміт встановлено.", adminKeyboard); }
   else if (action === "reset_limit") { await env.SESSIONS.delete(dailyKey(Number(text))); await sendMessage(env, chatId, "✅ Ліміт скинуто.", adminKeyboard); }
   else if (action === "block") await setBlocked(env, chatId, Number(text), true);
@@ -1363,7 +1433,8 @@ async function handleUpdate(env: Env, update: TelegramUpdate) {
       if (data === "admin:unblock") return promptAdmin(env, chatId, "unblock");
       if (data === "admin:broadcast") return promptAdmin(env, chatId, "broadcast");
       if (data === "admin:premium") return promptAdmin(env, chatId, "premium");
-      if (data === "admin:promo") return promptAdmin(env, chatId, "promo");
+      if (data === "admin:promo") return showPromoTypeMenu(env, chatId);
+      if (data === "admin:promo_type:premium" || data === "admin:promo_type:videos") return startPromoWizard(env, chatId, data.endsWith("premium") ? "premium" : "videos");
     }
     if (data === "language_menu") return sendMessage(env, chatId, "<b>Оберіть мову / Выберите язык / Choose language</b>", languageKeyboard);
     if (data.startsWith("language:")) {
